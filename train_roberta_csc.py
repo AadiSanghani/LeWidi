@@ -198,7 +198,7 @@ def train(args):
             p_hat = torch.softmax(logits, dim=-1)
             cdf_hat = torch.cumsum(p_hat, dim=-1)
             cdf_true = torch.cumsum(batch["dist"], dim=-1)
-            wass_loss = torch.mean(torch.sum(torch.abs(cdf_hat - cdf_true), dim=-1))
+            wass_loss = torch.sum(torch.abs(cdf_hat - cdf_true), dim=-1).mean()
 
             ce_loss = F.cross_entropy(logits, batch["labels"])
             loss = (1 - args.lambda_ce) * wass_loss + args.lambda_ce * ce_loss
@@ -212,7 +212,7 @@ def train(args):
 
             epoch_loss += loss.item()
             step += 1
-            prog.set_postfix(loss=f"{epoch_loss / step:.4f}")
+            prog.set_postfix(loss=f"{epoch_loss / step:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
         if val_loader:
             val_dist = evaluate(model, val_loader, device)
