@@ -10,6 +10,9 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 from torch.optim import AdamW
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
 
 
 class CSCDataset(Dataset):
@@ -163,14 +166,24 @@ def train(args):
     ]
     optimiser = AdamW(grouped_params, lr=args.lr)
     total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimiser,
-        num_warmup_steps=int(total_steps * args.warmup_ratio),
-        num_training_steps=total_steps,
-    )
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    decay_steps = args.lr_decay_steps  # already in optimizer steps
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        exponent = (current_step - warmup_steps) // max(1, decay_steps)
+        return args.lr_decay_gamma ** exponent
+
+    scheduler = LambdaLR(optimiser, lr_lambda)
 
     best_acc = 0.0
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Track metrics for plotting
+    train_loss_history = []
+    val_dist_history = []
+    lr_history = []  # learning rate per epoch
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -185,7 +198,10 @@ def train(args):
             p_hat = torch.softmax(logits, dim=-1)
             cdf_hat = torch.cumsum(p_hat, dim=-1)
             cdf_true = torch.cumsum(batch["dist"], dim=-1)
-            loss = torch.mean(torch.sum(torch.abs(cdf_hat - cdf_true), dim=-1))
+            wass_loss = torch.mean(torch.sum(torch.abs(cdf_hat - cdf_true), dim=-1))
+
+            ce_loss = F.cross_entropy(logits, batch["labels"])
+            loss = (1 - args.lambda_ce) * wass_loss + args.lambda_ce * ce_loss
 
             loss.backward()
 
@@ -209,9 +225,54 @@ def train(args):
                 tokenizer.save_pretrained(save_path)
                 print(f"Saved new best model to {save_path}")
 
+        # Collect metrics for plotting
+        train_loss_history.append(epoch_loss / step)
+        if val_loader:
+            val_dist_history.append(val_dist)
+        lr_history.append(optimiser.param_groups[0]['lr'])
+
     # Save final checkpoint
     model.save_pretrained(os.path.join(args.output_dir, "last_model"))
     tokenizer.save_pretrained(os.path.join(args.output_dir, "last_model"))
+
+    # Plot metrics with explicit epoch indices
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    num_cols = 3 if val_loader else 2
+    plt.figure(figsize=(6 * num_cols, 4))
+    plt.subplot(1, num_cols, 1)
+    plt.plot(epochs_range, train_loss_history, marker="o")
+    plt.title("Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.xticks(epochs_range[:: max(1, len(epochs_range) // 10)])  # at most 10 x-ticks
+
+    col_idx = 2  # current subplot index
+
+    if val_loader and val_dist_history:
+        plt.subplot(1, num_cols, col_idx)
+        plt.plot(epochs_range, val_dist_history, marker="o")
+        plt.title("Validation Wasserstein Distance")
+        plt.xlabel("Epoch")
+        plt.ylabel("Distance")
+        plt.xticks(epochs_range[:: max(1, len(epochs_range) // 10)])
+
+        # Annotate best epoch
+        best_epoch = int(np.argmin(val_dist_history)) + 1
+        best_val = min(val_dist_history)
+        plt.scatter([best_epoch], [best_val], color="red")
+        plt.text(best_epoch, best_val, f"  best={best_val:.3f}@{best_epoch}")
+        col_idx += 1
+
+    # Plot LR curve
+    plt.subplot(1, num_cols, col_idx)
+    plt.plot(epochs_range, lr_history, marker="o")
+    plt.title("Learning Rate Schedule")
+    plt.xlabel("Epoch")
+    plt.ylabel("LR")
+    plt.xticks(epochs_range[:: max(1, len(epochs_range) // 10)])
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "training_metrics.png"))
 
 
 if __name__ == "__main__":
@@ -228,6 +289,9 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.06)
     parser.add_argument("--balance", action="store_true", help="If set, use WeightedRandomSampler to mitigate class imbalance.")
     parser.add_argument("--num_bins", type=int, default=7, help="Number of label bins (e.g. 7 if ratings 0-6, 6 if 1-6).")
+    parser.add_argument("--lr_decay_steps", type=int, default=1000, help="Optimizer steps between LR decays after warmup.")
+    parser.add_argument("--lr_decay_gamma", type=float, default=0.9, help="Gamma for learning rate decay")
+    parser.add_argument("--lambda_ce", type=float, default=0.3, help="Weight for cross-entropy in mixed loss (0 means pure Wasserstein).")
 
     args = parser.parse_args()
     train(args) 
