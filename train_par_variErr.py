@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     RobertaTokenizer, RobertaModel, RobertaConfig,
-    AdamW, get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup
 )
 import pandas as pd
 import numpy as np
@@ -139,7 +139,10 @@ class Par_VariErrNLI(Dataset):
             num_classes = scale_range[1] - scale_range[0]
             soft_label = torch.zeros(num_classes)
             for ann in annotations:
-                ann = int(ann)  # Ensure ann is an integer
+                try:
+                    ann = int(ann)
+                except (ValueError, TypeError):
+                    continue  # Skip non-integer annotations
                 if scale_range[0] <= ann < scale_range[1]:
                     soft_label[ann - scale_range[0]] += 1
         else:
@@ -147,7 +150,10 @@ class Par_VariErrNLI(Dataset):
             num_classes = scale_range[1] - scale_range[0]
             soft_label = torch.zeros(num_classes)
             for ann in annotations:
-                ann = int(ann)  # Ensure ann is an integer
+                try:
+                    ann = int(ann)
+                except (ValueError, TypeError):
+                    continue  # Skip non-integer annotations
                 if scale_range[0] <= ann < scale_range[1]:
                     soft_label[ann - scale_range[0]] += 1
         
