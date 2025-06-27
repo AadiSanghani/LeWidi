@@ -48,7 +48,7 @@ class Par_VariErrNLI(Dataset):
         if isinstance(self.data, list):
             item = self.data[idx]
         else:
-            item = self.data.iloc[idx]
+            item = list(self.data.values())[idx]
         
         if self.dataset_type == "par":
             return self.process_par_item(item)
@@ -82,8 +82,8 @@ class Par_VariErrNLI(Dataset):
         
         # Process labels based on task type
         if self.task_type == "soft_label":
-            # Create soft label distribution (Likert scale 1-5)
-            soft_label = self.create_soft_label(annotations, scale_range=(1, 6))
+            # Create soft label distribution (Likert scale -5 to 5)
+            soft_label = self.create_soft_label(annotations, scale_range=(-5, 5))
         else:  # perspectivist
             # Store individual annotator labels
             soft_label = torch.tensor(annotations, dtype=torch.float)
@@ -139,6 +139,7 @@ class Par_VariErrNLI(Dataset):
             num_classes = scale_range[1] - scale_range[0]
             soft_label = torch.zeros(num_classes)
             for ann in annotations:
+                ann = int(ann)  # Ensure ann is an integer
                 if scale_range[0] <= ann < scale_range[1]:
                     soft_label[ann - scale_range[0]] += 1
         else:
@@ -146,6 +147,7 @@ class Par_VariErrNLI(Dataset):
             num_classes = scale_range[1] - scale_range[0]
             soft_label = torch.zeros(num_classes)
             for ann in annotations:
+                ann = int(ann)  # Ensure ann is an integer
                 if scale_range[0] <= ann < scale_range[1]:
                     soft_label[ann - scale_range[0]] += 1
         
@@ -336,7 +338,7 @@ def main():
     # Dataset configurations
     datasets_config = {
         'par': {
-            'num_classes': 6,  # Likert scale 1-6
+            'num_classes': 11,  # Likert scale -5 to 5
             'train_path': 'dataset/Paraphrase/Paraphrase_train.json', 
             'val_path': 'dataset/Paraphrase/Paraphrase_dev.json',
             'test_path': 'models/Paraphrase_test.json'
