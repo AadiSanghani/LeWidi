@@ -83,7 +83,7 @@ class Par_VariErrNLI(Dataset):
         # Process labels based on task type
         if self.task_type == "soft_label":
             # Create soft label distribution (Likert scale -5 to 5)
-            soft_label = self.create_soft_label(annotations, scale_range=(-5, 5))
+            soft_label = self.create_soft_label(annotations, scale_range=(-5, 6))
         else:  # perspectivist
             # Store individual annotator labels
             soft_label = torch.tensor(annotations, dtype=torch.float)
@@ -121,7 +121,7 @@ class Par_VariErrNLI(Dataset):
         # Process labels based on task type
         if self.task_type == "soft_label":
             # Create soft label distribution for 3-class NLI (entailment, neutral, contradiction)
-            soft_label = self.create_soft_label(annotations, scale_range=(0, 3), categorical=True)
+            soft_label = self.create_soft_label(annotations, scale_range=(-5, 6), categorical=True)
         else:  # perspectivist
             soft_label = torch.tensor(annotations, dtype=torch.float)
             
