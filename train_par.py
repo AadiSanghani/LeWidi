@@ -122,7 +122,11 @@ class RoBERTaForLeWiDi(nn.Module):
         }
 
 class LeWiDiTrainer:
-    def __init__(self, model, tokenizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, tokenizer, device=None):
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if isinstance(device, str):
+            device = torch.device(device)
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -206,8 +210,15 @@ def main():
     MODEL_NAME = 'roberta-base'
     MAX_LENGTH = 512
     BATCH_SIZE = 16
-    EPOCHS = 3
+    EPOCHS = 1  # For faster testing
     LEARNING_RATE = 2e-5
+
+    # Device check
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        print("Using device:", torch.cuda.get_device_name(0))
+    else:
+        print("Using device: CPU")
 
     tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
 
@@ -231,17 +242,17 @@ def main():
         )
 
         train_dataloader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
         )
         val_dataloader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2
         )
 
         num_annotators = 10 if task_type == 'perspectivist' else None
         model = RoBERTaForLeWiDi(
             MODEL_NAME, config['num_classes'], task_type, num_annotators
         )
-        trainer = LeWiDiTrainer(model, tokenizer)
+        trainer = LeWiDiTrainer(model, tokenizer, device=device)
         save_path = f'models/par_{task_type}_roberta'
         trainer.train(
             train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
@@ -276,5 +287,4 @@ def predict_example():
 if __name__ == "__main__":
     main()
     
-    
-predict_example()  # Uncomment to run example inference 
+    # predict_example()  # Uncomment to run example inference 
