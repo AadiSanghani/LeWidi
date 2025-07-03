@@ -6,6 +6,9 @@ from transformers import RobertaTokenizer, RobertaModel, get_linear_schedule_wit
 import os
 from typing import List, Tuple, Optional
 import warnings
+import csv
+import numpy as np
+from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 print("CUDA available:", torch.cuda.is_available())
@@ -296,7 +299,89 @@ def predict_example():
     predicted_class = torch.argmax(predictions, dim=-1).item() - 5  # -5 for Likert scale
     print(f"Most likely rating: {predicted_class}")
 
+def generate_submission_files():
+    """Generate Codabench submission files for Paraphrase soft label and perspectivist tasks."""
+    import json
+    import csv
+    from tqdm import tqdm
+
+    # Paths
+    test_json_path = 'dataset/Paraphrase/Paraphrase_test_clear.json'
+    soft_model_path = 'models/par_soft_label_roberta'
+    pe_model_path = 'models/par_perspectivist_roberta'
+    soft_out_path = 'Paraphrase_test_soft.tsv'
+    pe_out_path = 'Paraphrase_test_pe.tsv'
+
+    # Load test data
+    with open(test_json_path, 'r') as f:
+        test_data = json.load(f)
+
+    # Prepare tokenizer and models
+    tokenizer = RobertaTokenizer.from_pretrained(soft_model_path)
+    soft_model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='soft_label')
+    soft_trainer = LeWiDiTrainer(soft_model, tokenizer)
+    soft_trainer.load_model(soft_model_path)
+    soft_model.eval()
+
+    tokenizer_pe = RobertaTokenizer.from_pretrained(pe_model_path)
+    pe_model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
+    pe_trainer = LeWiDiTrainer(pe_model, tokenizer_pe)
+    pe_trainer.load_model(pe_model_path)
+    pe_model.eval()
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    soft_model.to(device)
+    pe_model.to(device)
+
+    # SOFT LABEL SUBMISSION (TASK A)
+    with open(soft_out_path, 'w', newline='') as f_out:
+        tsv_writer = csv.writer(f_out, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
+        for idx, item in tqdm(enumerate(test_data), total=len(test_data), desc='Soft label predictions'):
+            # Unique identifier: use index (or item['id'] if available)
+            uid = str(idx)
+            question1 = item['text']['Question1']
+            question2 = item['text']['Question2']
+            text = f"{question1} [SEP] {question2}"
+            encoding = tokenizer(
+                text, truncation=True, padding='max_length', 
+                max_length=512, return_tensors='pt'
+            )
+            input_ids = encoding['input_ids'].to(device)
+            attention_mask = encoding['attention_mask'].to(device)
+            with torch.no_grad():
+                outputs = soft_model(input_ids, attention_mask)
+                soft_pred = outputs['predictions'].cpu().numpy().flatten().tolist()
+            tsv_writer.writerow([uid, str(soft_pred)])
+
+    # PERSPECTIVIST SUBMISSION (TASK B)
+    with open(pe_out_path, 'w', newline='') as f_out:
+        tsv_writer = csv.writer(f_out, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
+        for idx, item in tqdm(enumerate(test_data), total=len(test_data), desc='Perspectivist predictions'):
+            uid = str(idx)
+            question1 = item['text']['Question1']
+            question2 = item['text']['Question2']
+            text = f"{question1} [SEP] {question2}"
+            encoding = tokenizer_pe(
+                text, truncation=True, padding='max_length', 
+                max_length=512, return_tensors='pt'
+            )
+            input_ids = encoding['input_ids'].to(device)
+            attention_mask = encoding['attention_mask'].to(device)
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            with torch.no_grad():
+                outputs = pe_model(input_ids, attention_mask)
+                # outputs['predictions']: [1, MAX_ANNOTATORS, 11]
+                preds = outputs['predictions'].cpu().numpy().reshape(MAX_ANNOTATORS, 11)
+                # For each annotator, pick the argmax (Likert scale -5 to 5)
+                annotator_preds = []
+                for i in range(len(annotator_list)):
+                    pred_class = int(np.argmax(preds[i]) - 5)
+                    annotator_preds.append(pred_class)
+            tsv_writer.writerow([uid, str(annotator_preds)])
+
 if __name__ == "__main__":
     main()
+    # Uncomment to generate submission files after training:
+    # generate_submission_files()
     
     # predict_example()  # Uncomment to run example inference 
