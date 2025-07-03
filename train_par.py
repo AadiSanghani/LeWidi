@@ -124,9 +124,18 @@ class RoBERTaForLeWiDi(nn.Module):
                 log_probs = F.log_softmax(logits, dim=-1)
                 loss = F.kl_div(log_probs, labels, reduction='batchmean')
             else:
+                # logits: [batch_size, num_annotators * num_classes] -> [batch_size, num_annotators, num_classes]
                 logits = logits.view(-1, self.num_annotators, self.num_classes)
-                loss = F.cross_entropy(logits.view(-1, self.num_classes), 
-                                     labels.long().view(-1), ignore_index=-100)
+                # labels: [batch_size, num_annotators] (float Likert values)
+                # For cross_entropy, labels must be integer class indices in [0, num_classes-1]
+                # Map Likert scale (-5 to 5) to class indices (0 to 10)
+                labels = labels + 5  # shift -5..5 to 0..10
+                labels = labels.long()
+                loss = F.cross_entropy(
+                    logits.view(-1, self.num_classes),      # [batch_size * num_annotators, num_classes]
+                    labels.view(-1),                        # [batch_size * num_annotators]
+                    ignore_index=-100
+                )
         return {
             'loss': loss,
             'logits': logits,
@@ -218,7 +227,7 @@ def main():
     MODEL_NAME = 'roberta-base'
     MAX_LENGTH = 512
     BATCH_SIZE = 16
-    EPOCHS = 1  # For faster testing
+    EPOCHS = 5  # Set to 5 epochs for real training
     LEARNING_RATE = 2e-5
 
     tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
