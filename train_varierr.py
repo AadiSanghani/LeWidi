@@ -8,8 +8,12 @@ from typing import List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
+MAX_ANNOTATORS = 5  # Maximum number of annotators for VariErrNLI
+NLI_LABELS = ["contradiction", "entailment", "neutral"]
+NLI_LABEL2IDX = {label: idx for idx, label in enumerate(NLI_LABELS)}
+
 class VariErrNLI_Dataset(Dataset):
-    """Dataset class for Par and VariErrNLI datasets"""
+    """Dataset class for VariErrNLI dataset"""
     def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
                  dataset_type: str = "varierrnli", task_type: str = "soft_label"):
         self.tokenizer = tokenizer
@@ -44,17 +48,9 @@ class VariErrNLI_Dataset(Dataset):
         # Not used in this script
         return {}
     def process_varierrnli_item(self, item):
-        if isinstance(item, dict):
-            premise = item.get('premise', '')
-            hypothesis = item.get('hypothesis', '')
-            annotations = item.get('annotations', [])
-            annotator_ids = item.get('annotator_ids', [])
-        else:
-            premise = item['premise']
-            hypothesis = item['hypothesis']
-            annotations = eval(item['annotations']) if isinstance(item['annotations'], str) else item['annotations']
-            annotator_ids = eval(item['annotator_ids']) if isinstance(item['annotator_ids'], str) else item['annotator_ids']
-        text = f"{premise} [SEP] {hypothesis}"
+        context = item['text']['context']
+        statement = item['text']['statement']
+        text = f"{context} [SEP] {statement}"
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -63,16 +59,35 @@ class VariErrNLI_Dataset(Dataset):
             return_tensors='pt'
         )
         if self.task_type == "soft_label":
-            soft_label = self.create_soft_label(annotations, scale_range=(0, 3), categorical=True)
+            # Build a 3-class vector [contradiction, entailment, neutral]
+            soft_label_dict = item['soft_label']
+            # For each class, average the values across annotators
+            soft_label = []
+            for label in NLI_LABELS:
+                # Get all values for this label (as floats)
+                label_scores = list(soft_label_dict[label].values())
+                avg_score = sum(float(x) for x in label_scores) / len(label_scores) if label_scores else 0.0
+                soft_label.append(avg_score)
+            soft_label = torch.tensor(soft_label, dtype=torch.float)
+            labels = soft_label
+            annotator_ids = []
         else:
-            soft_label = torch.tensor(annotations, dtype=torch.float)
+            # Perspectivist: map each annotator's label to int, pad to MAX_ANNOTATORS with -100
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            annotations_dict = item['annotations']
+            annotations = [NLI_LABEL2IDX[annotations_dict[ann]] for ann in annotator_list]
+            while len(annotations) < MAX_ANNOTATORS:
+                annotations.append(-100)
+            labels = torch.tensor(annotations, dtype=torch.float)
+            annotator_ids = []
         return {
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': soft_label,
-            'annotator_ids': torch.tensor(annotator_ids) if annotator_ids else torch.tensor([])
+            'labels': labels,
+            'annotator_ids': torch.tensor([])
         }
     def create_soft_label(self, annotations: List, scale_range: Tuple[int, int], categorical: bool = False):
+        # Not used anymore, but kept for compatibility
         num_classes = scale_range[1] - scale_range[0]
         soft_label = torch.zeros(num_classes)
         for ann in annotations:
