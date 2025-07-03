@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-class Par_VariErrNLI(Dataset):
+class VariErrNLI_Dataset(Dataset):
     """Dataset class for Par and VariErrNLI datasets"""
     def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
                  dataset_type: str = "varierrnli", task_type: str = "soft_label"):
@@ -63,7 +63,7 @@ class Par_VariErrNLI(Dataset):
             return_tensors='pt'
         )
         if self.task_type == "soft_label":
-            soft_label = self.create_soft_label(annotations, scale_range=(-5, 6), categorical=True)
+            soft_label = self.create_soft_label(annotations, scale_range=(0, 3), categorical=True)
         else:
             soft_label = torch.tensor(annotations, dtype=torch.float)
         return {
@@ -223,10 +223,10 @@ def main():
         print(f"Training on VARIERRNLI dataset - Task Type: {task_type}")
         print(f"{'='*50}")
 
-        train_dataset = Par_VariErrNLI(
+        train_dataset = VariErrNLI_Dataset(
             config['train_path'], tokenizer, MAX_LENGTH, 'varierrnli', task_type
         )
-        val_dataset = Par_VariErrNLI(
+        val_dataset = VariErrNLI_Dataset(
             config['val_path'], tokenizer, MAX_LENGTH, 'varierrnli', task_type
         )
 
