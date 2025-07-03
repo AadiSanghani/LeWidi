@@ -36,7 +36,6 @@ class MPDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        # Containers
         self.texts = []
         self.labels = []
         self.dists = []
@@ -44,19 +43,16 @@ class MPDataset(Dataset):
         self.employment_ids = []
         self.ethnicity_ids = []
 
-        # -------------------- Build vocabularies --------------------
         with open(annot_meta_path, "r", encoding="utf-8") as f:
             annot_meta = json.load(f)
 
         self.annot_meta = annot_meta
 
-        # Initialize value→idx maps with PAD & UNK
         self.vocab = {
             field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
             for field in self.FIELD_KEYS
         }
 
-        # Populate vocabularies
         for ann_data in annot_meta.values():
             for field, json_key in self.FIELD_KEYS.items():
                 val = str(ann_data.get(json_key, "")).strip()
@@ -65,10 +61,7 @@ class MPDataset(Dataset):
                 if val not in self.vocab[field]:
                     self.vocab[field][val] = len(self.vocab[field])
 
-        # Store vocab sizes for later model init
         self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
-
-        # -------------------- Load main examples --------------------
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -88,13 +81,11 @@ class MPDataset(Dataset):
             dist /= dist.sum()
             hard_label = int(np.argmax(dist))
 
-            # --------------- Map annotator demographics ---------------
             ann_str = ex.get("annotators", "")
             ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
             if not ann_list:
                 ann_list = []
 
-            # For each field, collect indices list for this example
             field_lists = {field: [] for field in self.FIELD_KEYS}
             for ann_tag in ann_list:
                 ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
@@ -104,7 +95,6 @@ class MPDataset(Dataset):
                     idx = self.vocab[field].get(val, self.UNK_IDX)
                     field_lists[field].append(idx)
 
-            # If no annotators or empty lists, use UNK
             for field in self.FIELD_KEYS:
                 if not field_lists[field]:
                     field_lists[field] = [self.UNK_IDX]
@@ -271,6 +261,97 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     }
 
 
+def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Plot and save training metrics and curves."""
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Training loss vs validation distance
+    ax_comb = axes[0, 0]
+    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+    if val_dist_history:
+        ax_comb_twin = ax_comb.twinx()
+        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
+        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
+    ax_comb.set_title('Training Loss vs Validation Distance')
+    ax_comb.set_xlabel('Epoch')
+    ax_comb.set_ylabel('Training Loss', color='blue')
+    ax_comb.tick_params(axis='y', labelcolor='blue')
+    ax_comb.grid(True, alpha=0.3)
+
+    # Validation distance with best epoch marker
+    if val_dist_history:
+        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
+        axes[0, 1].set_title('Validation Manhattan Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
+        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Analysis metrics
+    if analysis_history:
+        biases = [a['pred_bias'] for a in analysis_history]
+        errors = [a['mean_error'] for a in analysis_history]
+        axes[1, 1].plot(epochs_range, biases, marker='o', label='Prediction Bias', color='purple')
+        axes[1, 1].plot(epochs_range, errors, marker='s', label='Mean Abs Error', color='brown')
+        axes[1, 1].set_title('Prediction Analysis')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Metric Value')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Separate combined plot for quick reference
+    if val_dist_history:
+        fig2, ax1 = plt.subplots(figsize=(8, 5))
+        ax1.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Train Loss', color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
+        ax2 = ax1.twinx()
+        ax2.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax2.set_ylabel('Validation Distance', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+        ax1.set_title('Train Loss vs Val Distance')
+        ax1.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(os.path.join(output_dir, 'loss_vs_val.png'), dpi=150, bbox_inches='tight')
+        plt.close(fig2)
+
+    # Save metrics to JSON
+    metrics = {
+        'train_loss': [float(x) for x in train_loss_history],
+        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
+        'learning_rates': [float(x) for x in lr_history],
+        'analysis': [
+            {
+                'pred_bias': float(a['pred_bias']),
+                'pred_std': float(a['pred_std']),
+                'target_std': float(a['target_std']),
+                'mean_error': float(a['mean_error'])
+            } for a in analysis_history
+        ],
+        'best_epoch': int(best_epoch) if val_dist_history else None,
+        'best_metric': float(best_metric) if val_dist_history else None
+    }
+    
+    with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -369,11 +450,10 @@ def train(args):
                    num_training_steps=total_steps)
 
     best_metric = float("inf")
-    epochs_no_improve = 0  # counter for early stopping
-    best_epoch = 0  # track epoch of best validation metric
+    epochs_no_improve = 0
+    best_epoch = 0
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Track metrics for plotting
     train_loss_history = []
     val_dist_history = []
     lr_history = []
@@ -383,13 +463,12 @@ def train(args):
     print(f"Initial learning rate: {args.lr}")
 
     for epoch in range(1, args.epochs + 1):
-        # Unfreeze after the specified number of epochs
         if frozen_layers and epoch > args.freeze_epochs:
             for layer_idx in frozen_layers:
                 for p in model.text_model.encoder.layer[layer_idx].parameters():
                     p.requires_grad = True
             print(f"Unfroze layers {frozen_layers} at start of epoch {epoch}")
-            frozen_layers = []  # ensure we do not unfreeze again
+            frozen_layers = []
 
         model.train()
         epoch_loss = 0.0
@@ -413,10 +492,7 @@ def train(args):
             loss = (1 - args.lambda_kl) * l1_loss + args.lambda_kl * kl_loss
 
             loss.backward()
-            
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
             optimiser.step()
             scheduler.step()
             optimiser.zero_grad()
@@ -433,12 +509,10 @@ def train(args):
                 avg_kl = epoch_kl_loss / step_count
                 tqdm.write(f"Epoch {epoch} step {step}: total_loss={avg_loss:.4f}, l1_loss={avg_l1:.4f}, kl_loss={avg_kl:.4f}, lr={current_lr:.2e}")
 
-        # Validation
         if val_loader:
             val_dist, predictions, targets = evaluate(model, val_loader, device)
             print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
             
-            # Analyze predictions
             analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
             analysis_history.append(analysis)
             
@@ -460,122 +534,28 @@ def train(args):
             else:
                 epochs_no_improve += 1
 
-        # Collect metrics for plotting
         train_loss_history.append(epoch_loss / step_count)
         if val_loader:
             val_dist_history.append(val_dist)
         lr_history.append(scheduler.get_last_lr()[0])
 
-        # Early stopping
         if epochs_no_improve >= args.patience:
             print(f"Early stopping at epoch {epoch}")
             break
 
-    # Save final model
     final_path = os.path.join(args.output_dir, "last_model")
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
     tokenizer.save_pretrained(final_path)
 
-    # Visualize demographic embeddings
     visualize_demog_embeddings(model, train_ds, args.output_dir)
+    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
 
-    # Plot training curves
-    epochs_range = list(range(1, len(train_loss_history) + 1))
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-    # (0,0) Combined training loss & validation distance for overfitting check
-    ax_comb = axes[0, 0]
-    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-    if val_dist_history:
-        ax_comb_twin = ax_comb.twinx()
-        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
-        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
-    ax_comb.set_title('Training Loss vs Validation Distance')
-    ax_comb.set_xlabel('Epoch')
-    ax_comb.set_ylabel('Training Loss', color='blue')
-    ax_comb.tick_params(axis='y', labelcolor='blue')
-    ax_comb.grid(True, alpha=0.3)
-
-    # (0,1) Stand-alone validation distance plot with best epoch marker
-    if val_dist_history:
-        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
-        axes[0, 1].set_title('Validation Manhattan Distance')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Distance')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
-        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
-
-    # (1,0) Learning rate schedule
-    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
-    axes[1, 0].set_title('Learning Rate Schedule')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Learning Rate')
-    axes[1, 0].set_yscale('log')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # (1,1) Analysis metrics
-    if analysis_history:
-        biases = [a['pred_bias'] for a in analysis_history]
-        errors = [a['mean_error'] for a in analysis_history]
-        axes[1, 1].plot(epochs_range, biases, marker='o', label='Prediction Bias', color='purple')
-        axes[1, 1].plot(epochs_range, errors, marker='s', label='Mean Abs Error', color='brown')
-        axes[1, 1].set_title('Prediction Analysis')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Metric Value')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Separate combined plot saved individually for quick reference
-    if val_dist_history:
-        fig2, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Train Loss', color='blue')
-        ax1.tick_params(axis='y', labelcolor='blue')
-        ax2 = ax1.twinx()
-        ax2.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax2.set_ylabel('Validation Distance', color='orange')
-        ax2.tick_params(axis='y', labelcolor='orange')
-        ax1.set_title('Train Loss vs Val Distance')
-        ax1.grid(True, alpha=0.3)
-        fig2.tight_layout()
-        fig2.savefig(os.path.join(args.output_dir, 'loss_vs_val.png'), dpi=150, bbox_inches='tight')
-        plt.close(fig2)
-
-    # Save metrics to JSON
-    metrics = {
-        'train_loss': [float(x) for x in train_loss_history],
-        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
-        'learning_rates': [float(x) for x in lr_history],
-        'analysis': [
-            {
-                'pred_bias': float(a['pred_bias']),
-                'pred_std': float(a['pred_std']),
-                'target_std': float(a['target_std']),
-                'mean_error': float(a['mean_error'])
-            } for a in analysis_history
-        ],
-        'best_epoch': int(best_epoch) if val_dist_history else None,
-        'best_metric': float(best_metric) if val_dist_history else None
-    }
-    
-    with open(os.path.join(args.output_dir, 'training_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
-    
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
     if val_dist_history:
         print(f"Best epoch: {best_epoch}")
 
-    # Optionally plot per-annotator error after training
     if args.plot_annotator_error:
-        # Re-load best model for evaluation
         import torch
         from transformers import AutoTokenizer
         best_model_path = os.path.join(args.output_dir, "best_model", "pytorch_model.bin")
@@ -616,12 +596,11 @@ def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
         emb = emb_layer.weight.detach().cpu().numpy()
         if emb.shape[0] <= 2:
             continue
-        # Exclude PAD/UNK
         emb = emb[2:]
         labels = list(vocab.keys())[2:]
         if len(labels) != emb.shape[0]:
             continue
-        # PCA to 2D
+        
         X = emb - emb.mean(axis=0, keepdims=True)
         U, S, Vt = np.linalg.svd(X, full_matrices=False)
         coords = X.dot(Vt.T[:, :2])
@@ -629,7 +608,7 @@ def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
         plt.figure(figsize=(8, 6))
         plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
         for i, label in enumerate(labels):
-            if i % max(1, len(labels)//30) == 0:  # avoid clutter
+            if i % max(1, len(labels)//30) == 0:
                 plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
         plt.title(f"{title} Embeddings (PCA-2D)")
         plt.xlabel("PC1")
