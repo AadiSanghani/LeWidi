@@ -300,84 +300,110 @@ def predict_example():
     print(f"Most likely rating: {predicted_class}")
 
 def generate_submission_files():
-    """Generate Codabench submission files for Paraphrase soft label and perspectivist tasks."""
+    """Generate Codabench submission files for Paraphrase dataset using trained models."""
     import json
-    import csv
-    from tqdm import tqdm
-
-    # Paths
-    test_json_path = 'dataset/Paraphrase/Paraphrase_test_clear.json'
-    soft_model_path = 'models/par_soft_label_roberta'
-    pe_model_path = 'models/par_perspectivist_roberta'
-    soft_out_path = 'Paraphrase_test_soft.tsv'
-    pe_out_path = 'Paraphrase_test_pe.tsv'
-
+    import argparse
+    from pathlib import Path
+    
+    # Configuration for Paraphrase dataset
+    test_file = 'dataset/Paraphrase/Paraphrase_dev.json'  # Use dev for testing, change to test when available
+    max_length = 512
+    num_bins = 11  # Likert scale -5 to 5
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     # Load test data
-    with open(test_json_path, 'r') as f:
-        test_data = json.load(f)
-
-    # Prepare tokenizer and models
+    with open(test_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    # Convert to list if it's a dict
+    if isinstance(data, dict):
+        data = list(data.values())
+    
+    # Generate Task A (Soft Label) submission
+    print("Generating Task A (Soft Label) submission...")
+    soft_model_path = 'models/par_soft_label_roberta'
     tokenizer = RobertaTokenizer.from_pretrained(soft_model_path)
-    soft_model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='soft_label')
-    soft_trainer = LeWiDiTrainer(soft_model, tokenizer)
-    soft_trainer.load_model(soft_model_path)
-    soft_model.eval()
-
+    model = RoBERTaForLeWiDi('roberta-base', num_classes=num_bins, task_type='soft_label')
+    trainer = LeWiDiTrainer(model, tokenizer)
+    trainer.load_model(soft_model_path)
+    model.to(device)
+    model.eval()
+    
+    output_file = 'Paraphrase_test_soft.tsv'
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task A predictions"):
+            # Build input text
+            question1 = ex['text']['Question1']
+            question2 = ex['text']['Question2']
+            text = f"{question1} [SEP] {question2}"
+            
+            # Tokenize and predict
+            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+            with torch.no_grad():
+                outputs = model(enc['input_ids'], enc['attention_mask'])
+                probs = outputs['predictions'].squeeze(0).cpu()
+            
+            # Format output
+            out_probs = probs.tolist()
+            # Ensure we output exactly num_bins probabilities
+            if len(out_probs) < num_bins:
+                pad = [0.0] * (num_bins - len(out_probs))
+                out_probs = pad + out_probs
+            
+            # Round to 10 decimals and fix any rounding drift
+            out_probs = [round(p, 10) for p in out_probs]
+            drift = 1.0 - sum(out_probs)
+            if abs(drift) > 1e-10:
+                # add drift to the max prob to keep list summing to 1
+                idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
+                out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+            
+            prob_str = ",".join(f"{p:.10f}" for p in out_probs)
+            out_f.write(f"{idx}\t[{prob_str}]\n")
+    
+    print(f"Saved Task A submission file to {output_file}")
+    
+    # Generate Task B (Perspectivist) submission
+    print("Generating Task B (Perspectivist) submission...")
+    pe_model_path = 'models/par_perspectivist_roberta'
     tokenizer_pe = RobertaTokenizer.from_pretrained(pe_model_path)
-    pe_model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
-    pe_trainer = LeWiDiTrainer(pe_model, tokenizer_pe)
-    pe_trainer.load_model(pe_model_path)
-    pe_model.eval()
-
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    soft_model.to(device)
-    pe_model.to(device)
-
-    # SOFT LABEL SUBMISSION (TASK A)
-    with open(soft_out_path, 'w', newline='') as f_out:
-        tsv_writer = csv.writer(f_out, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
-        for idx, item in tqdm(enumerate(test_data), total=len(test_data), desc='Soft label predictions'):
-            # Unique identifier: use index (or item['id'] if available)
-            uid = str(idx)
-            question1 = item['text']['Question1']
-            question2 = item['text']['Question2']
+    model_pe = RoBERTaForLeWiDi('roberta-base', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
+    trainer_pe = LeWiDiTrainer(model_pe, tokenizer_pe)
+    trainer_pe.load_model(pe_model_path)
+    model_pe.to(device)
+    model_pe.eval()
+    
+    output_file_pe = 'Paraphrase_test_pe.tsv'
+    with open(output_file_pe, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task B predictions"):
+            # Build input text
+            question1 = ex['text']['Question1']
+            question2 = ex['text']['Question2']
             text = f"{question1} [SEP] {question2}"
-            encoding = tokenizer(
-                text, truncation=True, padding='max_length', 
-                max_length=512, return_tensors='pt'
-            )
-            input_ids = encoding['input_ids'].to(device)
-            attention_mask = encoding['attention_mask'].to(device)
+            
+            # Get annotator list
+            ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
+            
+            # Tokenize and predict
+            enc = tokenizer_pe(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
             with torch.no_grad():
-                outputs = soft_model(input_ids, attention_mask)
-                soft_pred = outputs['predictions'].cpu().numpy().flatten().tolist()
-            tsv_writer.writerow([uid, str(soft_pred)])
-
-    # PERSPECTIVIST SUBMISSION (TASK B)
-    with open(pe_out_path, 'w', newline='') as f_out:
-        tsv_writer = csv.writer(f_out, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
-        for idx, item in tqdm(enumerate(test_data), total=len(test_data), desc='Perspectivist predictions'):
-            uid = str(idx)
-            question1 = item['text']['Question1']
-            question2 = item['text']['Question2']
-            text = f"{question1} [SEP] {question2}"
-            encoding = tokenizer_pe(
-                text, truncation=True, padding='max_length', 
-                max_length=512, return_tensors='pt'
-            )
-            input_ids = encoding['input_ids'].to(device)
-            attention_mask = encoding['attention_mask'].to(device)
-            annotator_list = [a.strip() for a in item['annotators'].split(',')]
-            with torch.no_grad():
-                outputs = pe_model(input_ids, attention_mask)
-                # outputs['predictions']: [1, MAX_ANNOTATORS, 11]
-                preds = outputs['predictions'].cpu().numpy().reshape(MAX_ANNOTATORS, 11)
-                # For each annotator, pick the argmax (Likert scale -5 to 5)
-                annotator_preds = []
-                for i in range(len(annotator_list)):
-                    pred_class = int(np.argmax(preds[i]) - 5)
-                    annotator_preds.append(pred_class)
-            tsv_writer.writerow([uid, str(annotator_preds)])
+                outputs = model_pe(enc['input_ids'], enc['attention_mask'])
+                # outputs['predictions']: [1, MAX_ANNOTATORS, num_bins]
+                preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
+            
+            # For each annotator, get the predicted rating (argmax - 5 for Likert scale)
+            annotator_preds = []
+            for i in range(len(ann_list)):
+                rating_idx = torch.argmax(preds[i]).item()
+                rating = rating_idx - 5  # Convert to Likert scale -5 to 5
+                annotator_preds.append(str(rating))
+            
+            preds_str = ", ".join(annotator_preds)
+            out_f.write(f"{idx}\t[{preds_str}]\n")
+    
+    print(f"Saved Task B submission file to {output_file_pe}")
+    print("To submit: zip -j res.zip", output_file, output_file_pe)
 
 if __name__ == "__main__":
     main()
