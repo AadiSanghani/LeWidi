@@ -568,14 +568,6 @@ def train(args):
             model.load_state_dict(torch.load(best_model_path, map_location="cpu"))
             model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
             tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            plot_per_annotator_error(
-                model,
-                tokenizer,
-                args.val_file,
-                args.annot_meta,
-                torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                args.output_dir,
-            )
         else:
             print("Best model not found, skipping per-annotator error plot.")
 
@@ -619,78 +611,6 @@ def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
         plt.savefig(fname, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved {title} embedding visualisation → {fname}")
-
-
-def plot_per_annotator_error(model, tokenizer, dev_file, annot_meta_file, device, output_dir):
-    """Compute and plot per-annotator error rate for the Perspectivist Task (Task B)."""
-    import json
-    import os
-    with open(dev_file, "r", encoding="utf-8") as f:
-        dev_data = json.load(f)
-    with open(annot_meta_file, "r", encoding="utf-8") as f:
-        annot_meta = json.load(f)
-
-    annotator_errors = defaultdict(list)
-    model.eval()
-    for ex in dev_data.values():
-        post = ex["text"].get("post", "")
-        reply = ex["text"].get("reply", "")
-        full_text = f"{post} {tokenizer.sep_token} {reply}".strip()
-        ann_str = ex.get("annotators", "")
-        ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
-        if not ann_list:
-            continue
-        for ann_id in ann_list:
-            meta = annot_meta.get(ann_id[3:] if ann_id.startswith("Ann") else ann_id, {})
-            # Prepare demographic indices for this annotator
-            def get_idx(field, json_key, vocab):
-                val = str(meta.get(json_key, "")).strip()
-                return vocab[field].get(val, MPDataset.UNK_IDX)
-            # Use vocab from training set (assume model was trained with MPDataset)
-            vocab = model.country_emb.weight.device  # hack to get vocab from model, but not available here
-            # Instead, use a dummy MPDataset to get vocab
-            # (Assume train_ds is available in global scope)
-            # If not, skip this annotator
-            try:
-                country_idx = get_idx("country", "Country of residence", train_ds.vocab)
-                emp_idx = get_idx("employment", "Employment status", train_ds.vocab)
-                eth_idx = get_idx("ethnicity", "Ethnicity simplified", train_ds.vocab)
-            except Exception:
-                continue
-            # Prepare tensors
-            enc = tokenizer(full_text, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-            input_ids = enc["input_ids"].to(device)
-            attn = enc["attention_mask"].to(device)
-            country_ids = torch.tensor([[country_idx]], dtype=torch.long, device=device)
-            emp_ids = torch.tensor([[emp_idx]], dtype=torch.long, device=device)
-            eth_ids = torch.tensor([[eth_idx]], dtype=torch.long, device=device)
-            with torch.no_grad():
-                logits = model(
-                    input_ids=input_ids,
-                    attention_mask=attn,
-                    country_ids=country_ids,
-                    employment_ids=emp_ids,
-                    ethnicity_ids=eth_ids,
-                )
-                pred_label = int(torch.argmax(logits, dim=-1).item())
-            # True label for this annotator
-            true_label = int(ex["annotations"][ann_id])
-            error = int(pred_label != true_label)
-            annotator_errors[ann_id].append(error)
-    # Compute error rate per annotator
-    annotator_error_rate = {ann: sum(errs)/len(errs) for ann, errs in annotator_errors.items() if errs}
-    # Plot
-    plt.figure(figsize=(16, 4))
-    plt.bar(annotator_error_rate.keys(), annotator_error_rate.values())
-    plt.xlabel("Annotator ID")
-    plt.ylabel("Error Rate")
-    plt.title("Per-Annotator Error Rate (Task B)")
-    plt.xticks(rotation=90, fontsize=6)
-    plt.tight_layout()
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, "per_annotator_error.png"), dpi=150)
-    plt.close()
-    print(f"Saved per-annotator error plot to {os.path.join(output_dir, 'per_annotator_error.png')}")
 
 
 if __name__ == "__main__":
