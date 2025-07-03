@@ -13,6 +13,8 @@ print("CUDA device count:", torch.cuda.device_count())
 print("Current device:", torch.cuda.current_device())
 print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
+MAX_ANNOTATORS = 5  # Maximum number of annotators for Paraphrase dataset
+
 class Par_Dataset(Dataset):
     """Dataset class for Par dataset"""
     def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
@@ -46,26 +48,23 @@ class Par_Dataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
     def process_par_item(self, item):
-        # Extract questions from the 'text' field
         question1 = item['text']['Question1']
         question2 = item['text']['Question2']
-        # For soft_label task, use the 'soft_label' field
         if self.task_type == "soft_label":
-            # The soft_label field is a dict with string keys from -5 to 5
             soft_label_dict = item['soft_label']
-            # Ensure order from -5 to 5
             soft_label = [float(soft_label_dict[str(i)]) for i in range(-5, 6)]
             soft_label = torch.tensor(soft_label, dtype=torch.float)
             labels = soft_label
             annotator_ids = []
         else:
-            # For perspectivist, extract annotation values in the order of 'annotators' field
             annotator_list = [a.strip() for a in item['annotators'].split(',')]
             annotations_dict = item['annotations']
-            # Get annotation for each annotator in order, convert to float
+            # Build annotation list, pad to MAX_ANNOTATORS with -100
             annotations = [float(annotations_dict[ann]) for ann in annotator_list]
+            while len(annotations) < MAX_ANNOTATORS:
+                annotations.append(-100)
             labels = torch.tensor(annotations, dtype=torch.float)
-            annotator_ids = annotator_list
+            annotator_ids = []
         text = f"{question1} [SEP] {question2}"
         encoding = self.tokenizer(
             text,
@@ -78,7 +77,7 @@ class Par_Dataset(Dataset):
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
             'labels': labels,
-            'annotator_ids': torch.tensor([])  # Always a tensor, not a list
+            'annotator_ids': torch.tensor([])
         }
     def process_varierrnli_item(self, item):
         # Not used in this script
@@ -258,7 +257,7 @@ def main():
             val_dataset, batch_size=BATCH_SIZE, shuffle=False
         )
 
-        num_annotators = 10 if task_type == 'perspectivist' else None
+        num_annotators = MAX_ANNOTATORS if task_type == 'perspectivist' else None
         model = RoBERTaForLeWiDi(
             MODEL_NAME, config['num_classes'], task_type, num_annotators
         )
