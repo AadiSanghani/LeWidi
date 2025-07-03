@@ -277,6 +277,8 @@ def predict_example():
     model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='soft_label')
     trainer = LeWiDiTrainer(model, tokenizer)
     trainer.load_model('models/par_soft_label_roberta')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     question1 = "How do I reset my password?"
     question2 = "What's the procedure for changing my login credentials?"
     text = f"{question1} [SEP] {question2}"
@@ -284,11 +286,13 @@ def predict_example():
         text, truncation=True, padding='max_length', 
         max_length=512, return_tensors='pt'
     )
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
     model.eval()
     with torch.no_grad():
-        outputs = model(encoding['input_ids'], encoding['attention_mask'])
+        outputs = model(input_ids, attention_mask)
         predictions = outputs['predictions']
-    print(f"Soft label distribution: {predictions.numpy()}")
+    print(f"Soft label distribution: {predictions.cpu().numpy()}")
     predicted_class = torch.argmax(predictions, dim=-1).item() - 5  # -5 for Likert scale
     print(f"Most likely rating: {predicted_class}")
 
