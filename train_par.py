@@ -123,16 +123,15 @@ class RoBERTaForLeWiDi(nn.Module):
                 log_probs = F.log_softmax(logits, dim=-1)
                 loss = F.kl_div(log_probs, labels, reduction='batchmean')
             else:
-                # logits: [batch_size, num_annotators * num_classes] -> [batch_size, num_annotators, num_classes]
                 logits = logits.view(-1, self.num_annotators, self.num_classes)
-                # labels: [batch_size, num_annotators] (float Likert values)
-                # For cross_entropy, labels must be integer class indices in [0, num_classes-1]
-                # Map Likert scale (-5 to 5) to class indices (0 to 10)
-                labels = labels + 5  # shift -5..5 to 0..10
-                labels = labels.long()
+                # Only shift valid labels (not -100)
+                labels_shifted = labels.clone()
+                mask = (labels != -100)
+                labels_shifted[mask] = labels[mask] + 5
+                labels_shifted = labels_shifted.long()
                 loss = F.cross_entropy(
-                    logits.view(-1, self.num_classes),      # [batch_size * num_annotators, num_classes]
-                    labels.view(-1),                        # [batch_size * num_annotators]
+                    logits.view(-1, self.num_classes),
+                    labels_shifted.view(-1),
                     ignore_index=-100
                 )
         return {
