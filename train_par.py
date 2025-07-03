@@ -8,6 +8,11 @@ from typing import List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA device count:", torch.cuda.device_count())
+print("Current device:", torch.cuda.current_device())
+print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+
 class Par_Dataset(Dataset):
     """Dataset class for Par dataset"""
     def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
@@ -41,16 +46,26 @@ class Par_Dataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
     def process_par_item(self, item):
-        if isinstance(item, dict):
-            question1 = item.get('question1', '')
-            question2 = item.get('question2', '')
-            annotations = item.get('annotations', [])
-            annotator_ids = item.get('annotator_ids', [])
+        # Extract questions from the 'text' field
+        question1 = item['text']['Question1']
+        question2 = item['text']['Question2']
+        # For soft_label task, use the 'soft_label' field
+        if self.task_type == "soft_label":
+            # The soft_label field is a dict with string keys from -5 to 5
+            soft_label_dict = item['soft_label']
+            # Ensure order from -5 to 5
+            soft_label = [float(soft_label_dict[str(i)]) for i in range(-5, 6)]
+            soft_label = torch.tensor(soft_label, dtype=torch.float)
+            labels = soft_label
+            annotator_ids = []
         else:
-            question1 = item['question1']
-            question2 = item['question2']
-            annotations = eval(item['annotations']) if isinstance(item['annotations'], str) else item['annotations']
-            annotator_ids = eval(item['annotator_ids']) if isinstance(item['annotator_ids'], str) else item['annotator_ids']
+            # For perspectivist, extract annotation values in the order of 'annotators' field
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            annotations_dict = item['annotations']
+            # Get annotation for each annotator in order, convert to float
+            annotations = [float(annotations_dict[ann]) for ann in annotator_list]
+            labels = torch.tensor(annotations, dtype=torch.float)
+            annotator_ids = annotator_list
         text = f"{question1} [SEP] {question2}"
         encoding = self.tokenizer(
             text,
@@ -59,20 +74,17 @@ class Par_Dataset(Dataset):
             max_length=self.max_length,
             return_tensors='pt'
         )
-        if self.task_type == "soft_label":
-            soft_label = self.create_soft_label(annotations, scale_range=(-5, 6))
-        else:
-            soft_label = torch.tensor(annotations, dtype=torch.float)
         return {
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': soft_label,
-            'annotator_ids': torch.tensor(annotator_ids) if annotator_ids else torch.tensor([])
+            'labels': labels,
+            'annotator_ids': torch.tensor([]) if not annotator_ids else annotator_ids
         }
     def process_varierrnli_item(self, item):
         # Not used in this script
         return {}
     def create_soft_label(self, annotations: List, scale_range: Tuple[int, int], categorical: bool = False):
+        # Not used anymore, but kept for compatibility
         num_classes = scale_range[1] - scale_range[0]
         soft_label = torch.zeros(num_classes)
         for ann in annotations:
@@ -122,11 +134,7 @@ class RoBERTaForLeWiDi(nn.Module):
         }
 
 class LeWiDiTrainer:
-    def __init__(self, model, tokenizer, device=None):
-        if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if isinstance(device, str):
-            device = torch.device(device)
+    def __init__(self, model, tokenizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -213,13 +221,6 @@ def main():
     EPOCHS = 1  # For faster testing
     LEARNING_RATE = 2e-5
 
-    # Device check
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if torch.cuda.is_available():
-        print("Using device:", torch.cuda.get_device_name(0))
-    else:
-        print("Using device: CPU")
-
     tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
 
     config = {
@@ -242,17 +243,17 @@ def main():
         )
 
         train_dataloader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True
         )
         val_dataloader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False
         )
 
         num_annotators = 10 if task_type == 'perspectivist' else None
         model = RoBERTaForLeWiDi(
             MODEL_NAME, config['num_classes'], task_type, num_annotators
         )
-        trainer = LeWiDiTrainer(model, tokenizer, device=device)
+        trainer = LeWiDiTrainer(model, tokenizer)
         save_path = f'models/par_{task_type}_roberta'
         trainer.train(
             train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
