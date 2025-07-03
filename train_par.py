@@ -78,7 +78,7 @@ class Par_Dataset(Dataset):
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
             'labels': labels,
-            'annotator_ids': torch.tensor([]) if not annotator_ids else annotator_ids
+            'annotator_ids': torch.tensor([])  # Always a tensor, not a list
         }
     def process_varierrnli_item(self, item):
         # Not used in this script
