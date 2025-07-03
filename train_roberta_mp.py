@@ -14,6 +14,47 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 
+class MPDemogModel(torch.nn.Module):
+    """RoBERTa model with demographic embeddings for annotator-aware irony detection."""
+    
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 16):
+        super().__init__()
+        from transformers import AutoModel
+
+        self.text_model = AutoModel.from_pretrained(base_name)
+        self.country_emb = torch.nn.Embedding(vocab_sizes["country"], dem_dim, padding_idx=0)
+        self.emp_emb = torch.nn.Embedding(vocab_sizes["employment"], dem_dim, padding_idx=0)
+        self.eth_emb = torch.nn.Embedding(vocab_sizes["ethnicity"], dem_dim, padding_idx=0)
+
+        hidden_size = self.text_model.config.hidden_size
+        total_dim = hidden_size + 3 * dem_dim
+        self.norm = torch.nn.LayerNorm(total_dim)
+        self.dropout = torch.nn.Dropout(0.5)
+        self.classifier = torch.nn.Linear(total_dim, 2)
+
+    def _avg_emb(self, emb_layer, idx_tensor):
+        """Average embeddings across multiple annotators, ignoring padding."""
+        emb = emb_layer(idx_tensor)
+        mask = (idx_tensor != 0).unsqueeze(-1).float()
+        summed = (emb * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-6)
+        return summed / counts
+
+    def forward(self, *, input_ids, attention_mask, country_ids, employment_ids, ethnicity_ids):
+        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state[:, 0]
+
+        country_vec = self._avg_emb(self.country_emb, country_ids)
+        emp_vec = self._avg_emb(self.emp_emb, employment_ids)
+        eth_vec = self._avg_emb(self.eth_emb, ethnicity_ids)
+
+        concat = torch.cat([pooled, country_vec, emp_vec, eth_vec], dim=-1)
+        concat = self.norm(concat)
+        concat = self.dropout(concat)
+        logits = self.classifier(concat)
+        return logits
+
+
 class MPDataset(Dataset):
     """Dataset with demographic embeddings (country, employment, ethnicity)."""
 
@@ -376,44 +417,6 @@ def train(args):
         DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
     )
 
-    class MPDemogModel(torch.nn.Module):
-        def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 16):
-            super().__init__()
-            from transformers import AutoModel
-
-            self.text_model = AutoModel.from_pretrained(base_name)
-            # Embeddings for each demographic field
-            self.country_emb = torch.nn.Embedding(vocab_sizes["country"], dem_dim, padding_idx=MPDataset.PAD_IDX)
-            self.emp_emb = torch.nn.Embedding(vocab_sizes["employment"], dem_dim, padding_idx=MPDataset.PAD_IDX)
-            self.eth_emb = torch.nn.Embedding(vocab_sizes["ethnicity"], dem_dim, padding_idx=MPDataset.PAD_IDX)
-
-            hidden_size = self.text_model.config.hidden_size
-            total_dim = hidden_size + 3 * dem_dim
-            self.norm = torch.nn.LayerNorm(total_dim)
-            self.dropout = torch.nn.Dropout(0.5)  # Increased dropout
-            self.classifier = torch.nn.Linear(total_dim, 2)
-
-        def _avg_emb(self, emb_layer, idx_tensor):
-            emb = emb_layer(idx_tensor)
-            mask = (idx_tensor != MPDataset.PAD_IDX).unsqueeze(-1).float()
-            summed = (emb * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1e-6)
-            return summed / counts
-
-        def forward(self, *, input_ids, attention_mask, country_ids, employment_ids, ethnicity_ids):
-            outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = outputs.last_hidden_state[:, 0]
-
-            country_vec = self._avg_emb(self.country_emb, country_ids)
-            emp_vec = self._avg_emb(self.emp_emb, employment_ids)
-            eth_vec = self._avg_emb(self.eth_emb, ethnicity_ids)
-
-            concat = torch.cat([pooled, country_vec, emp_vec, eth_vec], dim=-1)
-            concat = self.norm(concat)
-            concat = self.dropout(concat)
-            logits = self.classifier(concat)
-            return logits
-
     model = MPDemogModel(
         base_name=args.model_name,
         vocab_sizes=train_ds.vocab_sizes,
@@ -421,7 +424,6 @@ def train(args):
     )
     model.to(device)
 
-    # ---------------- Layer Freezing Schedule ----------------
     frozen_layers = []
     if getattr(args, "freeze_layers", 0) > 0:
         for layer in model.text_model.encoder.layer[: args.freeze_layers]:
@@ -430,7 +432,6 @@ def train(args):
         frozen_layers = list(range(args.freeze_layers))
         if frozen_layers:
             print(f"Frozen transformer layers: {frozen_layers} for first {args.freeze_epochs} epoch(s)")
-    # ---------------------------------------------------------
 
     no_decay = ["bias", "LayerNorm.weight"]
     grouped_params = [
@@ -441,7 +442,6 @@ def train(args):
     ]
     optimiser = AdamW(grouped_params, lr=args.lr)
 
-    # Add proper learning rate scheduler with warmup
     total_steps = len(train_loader) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(
@@ -555,22 +555,6 @@ def train(args):
     if val_dist_history:
         print(f"Best epoch: {best_epoch}")
 
-    if args.plot_annotator_error:
-        import torch
-        from transformers import AutoTokenizer
-        best_model_path = os.path.join(args.output_dir, "best_model", "pytorch_model.bin")
-        if os.path.exists(best_model_path):
-            model = MPDemogModel(
-                base_name=args.model_name,
-                vocab_sizes=train_ds.vocab_sizes,
-                dem_dim=args.dem_dim,
-            )
-            model.load_state_dict(torch.load(best_model_path, map_location="cpu"))
-            model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        else:
-            print("Best model not found, skipping per-annotator error plot.")
-
 
 def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
     """Save 2-D PCA scatter plots of demographic embeddings."""
@@ -632,7 +616,6 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_epochs", type=int, default=1, help="Number of epochs to freeze layers")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler")
-    parser.add_argument("--plot_annotator_error", action="store_true", help="Plot per-annotator error after training (Task B)")
 
     args = parser.parse_args()
     train(args) 
