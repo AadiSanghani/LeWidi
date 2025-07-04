@@ -17,19 +17,22 @@ import matplotlib.pyplot as plt
 class MPDemogModel(torch.nn.Module):
     """RoBERTa model with demographic embeddings for annotator-aware irony detection."""
     
-    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 16):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, dropout_rate: float = 0.3):
         super().__init__()
         from transformers import AutoModel
 
         self.text_model = AutoModel.from_pretrained(base_name)
-        self.country_emb = torch.nn.Embedding(vocab_sizes["country"], dem_dim, padding_idx=0)
-        self.emp_emb = torch.nn.Embedding(vocab_sizes["employment"], dem_dim, padding_idx=0)
-        self.eth_emb = torch.nn.Embedding(vocab_sizes["ethnicity"], dem_dim, padding_idx=0)
+        
+        # Create embeddings dynamically based on vocab_sizes
+        self.demographic_embeddings = torch.nn.ModuleDict()
+        for field, vocab_size in vocab_sizes.items():
+            self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
         hidden_size = self.text_model.config.hidden_size
-        total_dim = hidden_size + 3 * dem_dim
+        num_demog_fields = len(vocab_sizes)
+        total_dim = hidden_size + num_demog_fields * dem_dim
         self.norm = torch.nn.LayerNorm(total_dim)
-        self.dropout = torch.nn.Dropout(0.5)
+        self.dropout = torch.nn.Dropout(dropout_rate)  # Increased dropout for regularization
         self.classifier = torch.nn.Linear(total_dim, 2)
 
     def _avg_emb(self, emb_layer, idx_tensor):
@@ -40,15 +43,24 @@ class MPDemogModel(torch.nn.Module):
         counts = mask.sum(dim=1).clamp(min=1e-6)
         return summed / counts
 
-    def forward(self, *, input_ids, attention_mask, country_ids, employment_ids, ethnicity_ids):
+    def forward(self, *, input_ids, attention_mask, **demographic_inputs):
         outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0]
 
-        country_vec = self._avg_emb(self.country_emb, country_ids)
-        emp_vec = self._avg_emb(self.emp_emb, employment_ids)
-        eth_vec = self._avg_emb(self.eth_emb, ethnicity_ids)
+        # Get demographic embeddings dynamically
+        demographic_vectors = []
+        for field, emb_layer in self.demographic_embeddings.items():
+            field_key = f"{field}_ids"
+            if field_key in demographic_inputs:
+                demographic_vec = self._avg_emb(emb_layer, demographic_inputs[field_key])
+                demographic_vectors.append(demographic_vec)
 
-        concat = torch.cat([pooled, country_vec, emp_vec, eth_vec], dim=-1)
+        # Concatenate all vectors
+        if demographic_vectors:
+            concat = torch.cat([pooled] + demographic_vectors, dim=-1)
+        else:
+            concat = pooled
+            
         concat = self.norm(concat)
         concat = self.dropout(concat)
         logits = self.classifier(concat)
@@ -56,16 +68,50 @@ class MPDemogModel(torch.nn.Module):
 
 
 class MPDataset(Dataset):
-    """Dataset with demographic embeddings (country, employment, ethnicity)."""
+    """Dataset with all demographic embeddings."""
 
     PAD_IDX = 0  # padding
     UNK_IDX = 1  # unknown / missing
 
     FIELD_KEYS = {
-        "country": "Country of residence",
-        "employment": "Employment status",
+        "age": "Age",  # Will be binned
+        "gender": "Gender",
         "ethnicity": "Ethnicity simplified",
+        "country_birth": "Country of birth",
+        "country_residence": "Country of residence",
+        "nationality": "Nationality",
+        "student": "Student status",
+        "employment": "Employment status",
     }
+
+    # Reduced field set for better performance
+    REDUCED_FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender", 
+        "ethnicity": "Ethnicity simplified",
+        "country_residence": "Country of residence",
+        "employment": "Employment status",
+    }
+
+    @staticmethod
+    def get_age_bin(age):
+        """Convert age to age bin."""
+        if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
+            return "<UNK>"
+        try:
+            age = float(age)
+            if age < 25:
+                return "18-24"
+            elif age < 35:
+                return "25-34"
+            elif age < 45:
+                return "35-44"
+            elif age < 55:
+                return "45-54"
+            else:
+                return "55+"
+        except (ValueError, TypeError):
+            return "<UNK>"
 
     def __init__(
         self,
@@ -76,13 +122,16 @@ class MPDataset(Dataset):
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        
+        # Always use reduced demographics for better performance
+        self.active_field_keys = self.REDUCED_FIELD_KEYS
 
         self.texts = []
         self.labels = []
         self.dists = []
-        self.country_ids = []
-        self.employment_ids = []
-        self.ethnicity_ids = []
+        
+        # Initialize storage for active fields only
+        self.demographic_ids = {field: [] for field in self.active_field_keys}
 
         with open(annot_meta_path, "r", encoding="utf-8") as f:
             annot_meta = json.load(f)
@@ -91,16 +140,23 @@ class MPDataset(Dataset):
 
         self.vocab = {
             field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
-            for field in self.FIELD_KEYS
+            for field in self.active_field_keys
         }
 
+        # Build vocabulary from all annotators
         for ann_data in annot_meta.values():
-            for field, json_key in self.FIELD_KEYS.items():
-                val = str(ann_data.get(json_key, "")).strip()
-                if val == "":
-                    continue
-                if val not in self.vocab[field]:
-                    self.vocab[field][val] = len(self.vocab[field])
+            for field, json_key in self.active_field_keys.items():
+                if field == "age":
+                    # Special handling for age - convert to age bin
+                    age_bin = self.get_age_bin(ann_data.get(json_key))
+                    if age_bin not in self.vocab[field]:
+                        self.vocab[field][age_bin] = len(self.vocab[field])
+                else:
+                    val = str(ann_data.get(json_key, "")).strip()
+                    if val == "":
+                        val = "<UNK>"
+                    if val not in self.vocab[field]:
+                        self.vocab[field][val] = len(self.vocab[field])
 
         self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
         with open(path, "r", encoding="utf-8") as f:
@@ -127,25 +183,30 @@ class MPDataset(Dataset):
             if not ann_list:
                 ann_list = []
 
-            field_lists = {field: [] for field in self.FIELD_KEYS}
+            field_lists = {field: [] for field in self.active_field_keys}
             for ann_tag in ann_list:
                 ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
                 meta = annot_meta.get(ann_num, {})
-                for field, json_key in self.FIELD_KEYS.items():
-                    val = str(meta.get(json_key, "")).strip()
-                    idx = self.vocab[field].get(val, self.UNK_IDX)
+                for field, json_key in self.active_field_keys.items():
+                    if field == "age":
+                        age_bin = self.get_age_bin(meta.get(json_key))
+                        idx = self.vocab[field].get(age_bin, self.UNK_IDX)
+                    else:
+                        val = str(meta.get(json_key, "")).strip()
+                        if val == "":
+                            val = "<UNK>"
+                        idx = self.vocab[field].get(val, self.UNK_IDX)
                     field_lists[field].append(idx)
 
-            for field in self.FIELD_KEYS:
+            for field in self.active_field_keys:
                 if not field_lists[field]:
                     field_lists[field] = [self.UNK_IDX]
 
             self.texts.append(full_text)
             self.dists.append(dist)
             self.labels.append(hard_label)
-            self.country_ids.append(field_lists["country"])
-            self.employment_ids.append(field_lists["employment"])
-            self.ethnicity_ids.append(field_lists["ethnicity"])
+            for field in self.active_field_keys:
+                self.demographic_ids[field].append(field_lists[field])
 
     def __len__(self):
         return len(self.labels)
@@ -158,15 +219,18 @@ class MPDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-        return {
+        result = {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-            "country_ids": torch.tensor(self.country_ids[idx], dtype=torch.long),
-            "employment_ids": torch.tensor(self.employment_ids[idx], dtype=torch.long),
-            "ethnicity_ids": torch.tensor(self.ethnicity_ids[idx], dtype=torch.long),
         }
+        
+        # Add demographic fields dynamically
+        for field in self.active_field_keys:
+            result[f"{field}_ids"] = torch.tensor(self.demographic_ids[field][idx], dtype=torch.long)
+        
+        return result
 
 
 def _pad_list_tensors(list_of_1d):
@@ -188,19 +252,22 @@ def collate_fn(batch):
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)
     attn = pad_sequence(attn, batch_first=True, padding_value=0)
 
-    country_tensor = _pad_list_tensors([b["country_ids"] for b in batch])
-    employ_tensor = _pad_list_tensors([b["employment_ids"] for b in batch])
-    ethnic_tensor = _pad_list_tensors([b["ethnicity_ids"] for b in batch])
-
-    return {
+    result = {
         "input_ids": input_ids,
         "attention_mask": attn,
         "labels": labels,
         "dist": dists,
-        "country_ids": country_tensor,
-        "employment_ids": employ_tensor,
-        "ethnicity_ids": ethnic_tensor,
     }
+    
+    # Dynamically handle demographic fields
+    demographic_keys = [k for k in batch[0].keys() 
+                        if k.endswith("_ids") and k not in ["input_ids"]]
+    for key in demographic_keys:
+        tensors = [b[key] for b in batch]
+        padded = _pad_list_tensors(tensors)
+        result[key] = padded
+
+    return result
 
 
 def build_sampler(labels):
@@ -224,12 +291,15 @@ def evaluate(model, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Prepare demographic inputs dynamically (exclude input_ids and attention_mask)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                country_ids=batch["country_ids"],
-                employment_ids=batch["employment_ids"],
-                ethnicity_ids=batch["ethnicity_ids"],
+                **demographic_inputs
             )
             p_hat = torch.softmax(logits, dim=-1)
             dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
@@ -421,6 +491,7 @@ def train(args):
         base_name=args.model_name,
         vocab_sizes=train_ds.vocab_sizes,
         dem_dim=args.dem_dim,
+        dropout_rate=args.dropout_rate,
     )
     model.to(device)
 
@@ -478,12 +549,15 @@ def train(args):
         
         for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
             batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Prepare demographic inputs dynamically (exclude input_ids and attention_mask)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                country_ids=batch["country_ids"],
-                employment_ids=batch["employment_ids"],
-                ethnicity_ids=batch["ethnicity_ids"],
+                **demographic_inputs
             )
 
             p_hat = torch.softmax(logits, dim=-1)
@@ -562,18 +636,29 @@ def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
     import numpy as np
     os.makedirs(output_dir, exist_ok=True)
 
-    emb_info = [
-        ("country_emb", model.country_emb, dataset.vocab["country"], "Country of residence"),
-        ("emp_emb", model.emp_emb, dataset.vocab["employment"], "Employment status"),
-        ("eth_emb", model.eth_emb, dataset.vocab["ethnicity"], "Ethnicity simplified"),
-    ]
+    # Get field names and their display names
+    field_display_names = {
+        "age": "Age",
+        "gender": "Gender", 
+        "ethnicity": "Ethnicity simplified",
+        "country_birth": "Country of birth",
+        "country_residence": "Country of residence", 
+        "nationality": "Nationality",
+        "student": "Student status",
+        "employment": "Employment status"
+    }
 
-    for name, emb_layer, vocab, title in emb_info:
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            continue
+            
+        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
+        
         emb = emb_layer.weight.detach().cpu().numpy()
         if emb.shape[0] <= 2:
             continue
-        emb = emb[2:]
-        labels = list(vocab.keys())[2:]
+        emb = emb[2:]  # Skip PAD and UNK
+        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
         if len(labels) != emb.shape[0]:
             continue
         
@@ -586,15 +671,15 @@ def visualize_demog_embeddings(model, dataset: MPDataset, output_dir: str):
         for i, label in enumerate(labels):
             if i % max(1, len(labels)//30) == 0:
                 plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-        plt.title(f"{title} Embeddings (PCA-2D)")
+        plt.title(f"{display_name} Embeddings (PCA-2D)")
         plt.xlabel("PC1")
         plt.ylabel("PC2")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        fname = os.path.join(output_dir, f"{name}_pca.png")
+        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
         plt.savefig(fname, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Saved {title} embedding visualisation → {fname}")
+        print(f"Saved {display_name} embedding visualisation → {fname}")
 
 
 if __name__ == "__main__":
@@ -610,12 +695,13 @@ if __name__ == "__main__":
     parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
     parser.add_argument("--lambda_kl", type=float, default=0.3, help="Weight for KL in mixed loss (0=L1 only)")
     parser.add_argument("--annot_meta", type=str, default="dataset/MP/MP_annotators_meta.json", help="Path to annotator metadata JSON")
-    parser.add_argument("--dem_dim", type=int, default=16, help="Dimension of each demographic embedding")
+    parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--patience", type=int, default=3, help="Number of epochs without improvement for early stopping")
     parser.add_argument("--freeze_layers", type=int, default=0, help="Number of layers to freeze")
     parser.add_argument("--freeze_epochs", type=int, default=1, help="Number of epochs to freeze layers")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler")
+    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
 
     args = parser.parse_args()
     train(args) 
