@@ -4,7 +4,8 @@ from pathlib import Path
 
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer
+from train_roberta_mp import MPDemogModel
 
 
 def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
@@ -16,11 +17,78 @@ def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
     return reply
 
 
+def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
+    """Process demographic data for a single example."""
+    PAD_IDX = 0
+    UNK_IDX = 1
+    
+    FIELD_KEYS = {
+        "country": "Country of residence",
+        "employment": "Employment status", 
+        "ethnicity": "Ethnicity simplified",
+    }
+    
+    ann_str = example.get("annotators", "")
+    ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
+    if not ann_list:
+        ann_list = []
+
+    field_lists = {field: [] for field in FIELD_KEYS}
+    for ann_tag in ann_list:
+        ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
+        meta = annot_meta.get(ann_num, {})
+        for field, json_key in FIELD_KEYS.items():
+            val = str(meta.get(json_key, "")).strip()
+            idx = vocab[field].get(val, UNK_IDX)
+            field_lists[field].append(idx)
+
+    for field in FIELD_KEYS:
+        if not field_lists[field]:
+            field_lists[field] = [UNK_IDX]
+            
+    return field_lists
+
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir)
+    
+    # Load annotator metadata and build vocabulary
+    with open(args.annot_meta, "r", encoding="utf-8") as f:
+        annot_meta = json.load(f)
+    
+    # Build vocabulary from annotator metadata
+    FIELD_KEYS = {
+        "country": "Country of residence",
+        "employment": "Employment status",
+        "ethnicity": "Ethnicity simplified",
+    }
+    
+    vocab = {
+        field: {"<PAD>": 0, "<UNK>": 1}
+        for field in FIELD_KEYS
+    }
+
+    for ann_data in annot_meta.values():
+        for field, json_key in FIELD_KEYS.items():
+            val = str(ann_data.get(json_key, "")).strip()
+            if val == "":
+                continue
+            if val not in vocab[field]:
+                vocab[field][val] = len(vocab[field])
+
+    vocab_sizes = {field: len(v) for field, v in vocab.items()}
+    
+    # Load the custom model with the base model name
+    model = MPDemogModel(
+        base_name=args.base_model_name,
+        vocab_sizes=vocab_sizes,
+        dem_dim=args.dem_dim
+    )
+    
+    # Load the trained weights
+    model.load_state_dict(torch.load(f"{args.model_dir}/pytorch_model.bin", map_location=device))
     model.to(device)
     model.eval()
 
@@ -37,8 +105,23 @@ def main(args):
         for ex_id, ex in tqdm(data.items(), desc="Predicting"):
             text = build_input(ex, tokenizer)
             enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
+            
+            # Process demographic data
+            dem_data = process_demographic_data(ex, annot_meta, vocab)
+            
+            # Convert to tensors and pad
+            country_ids = torch.tensor([dem_data["country"]], dtype=torch.long).to(device)
+            employment_ids = torch.tensor([dem_data["employment"]], dtype=torch.long).to(device)
+            ethnicity_ids = torch.tensor([dem_data["ethnicity"]], dtype=torch.long).to(device)
+            
             with torch.no_grad():
-                logits = model(**enc).logits
+                logits = model(
+                    input_ids=enc["input_ids"],
+                    attention_mask=enc["attention_mask"],
+                    country_ids=country_ids,
+                    employment_ids=employment_ids,
+                    ethnicity_ids=ethnicity_ids
+                )
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
@@ -76,11 +159,13 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate submission TSV for MP dataset (Task A or B).")
     parser.add_argument("--model_dir", type=str, required=True, help="Path to fine-tuned model directory")
+    parser.add_argument("--base_model_name", type=str, default="roberta-large", help="Base model name (e.g., roberta-large)")
     parser.add_argument("--test_file", type=str, required=True, help="Path to *_test_clear.json file")
+    parser.add_argument("--annot_meta", type=str, default="dataset/MP/MP_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--task", choices=["A", "B"], default="A", help="Which task: A (soft) or B (perspectivist)")
     parser.add_argument("--output_tsv", type=str, default=None, help="Optional output filename")
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--num_bins", type=int, default=2, help="Number of bins to output for task A (2 for binary).")
+    parser.add_argument("--dem_dim", type=int, default=16, help="Dimension of each demographic embedding")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
     args = parser.parse_args()
     main(args) 
