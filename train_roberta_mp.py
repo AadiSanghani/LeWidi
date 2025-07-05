@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -35,24 +36,17 @@ class MPDemogModel(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout_rate)  # Increased dropout for regularization
         self.classifier = torch.nn.Linear(total_dim, 2)
 
-    def _avg_emb(self, emb_layer, idx_tensor):
-        """Average embeddings across multiple annotators, ignoring padding."""
-        emb = emb_layer(idx_tensor)
-        mask = (idx_tensor != 0).unsqueeze(-1).float()
-        summed = (emb * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-6)
-        return summed / counts
-
     def forward(self, *, input_ids, attention_mask, **demographic_inputs):
         outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0]
 
-        # Get demographic embeddings dynamically
+        # Get demographic embeddings dynamically - now each input is a single ID, not a list
         demographic_vectors = []
         for field, emb_layer in self.demographic_embeddings.items():
             field_key = f"{field}_ids"
             if field_key in demographic_inputs:
-                demographic_vec = self._avg_emb(emb_layer, demographic_inputs[field_key])
+                # No need for averaging - each input is a single annotator ID
+                demographic_vec = emb_layer(demographic_inputs[field_key])
                 demographic_vectors.append(demographic_vec)
 
         # Concatenate all vectors
@@ -130,7 +124,7 @@ class MPDataset(Dataset):
         self.labels = []
         self.dists = []
         
-        # Initialize storage for active fields only
+        # Initialize storage for active fields only - now storing single values per example
         self.demographic_ids = {field: [] for field in self.active_field_keys}
 
         with open(annot_meta_path, "r", encoding="utf-8") as f:
@@ -159,6 +153,7 @@ class MPDataset(Dataset):
                         self.vocab[field][val] = len(self.vocab[field])
 
         self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
+        
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -183,10 +178,13 @@ class MPDataset(Dataset):
             if not ann_list:
                 ann_list = []
 
-            field_lists = {field: [] for field in self.active_field_keys}
+            # Create separate examples for each annotator
             for ann_tag in ann_list:
                 ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
                 meta = annot_meta.get(ann_num, {})
+                
+                # Get demographic info for this specific annotator
+                annotator_demog_ids = {}
                 for field, json_key in self.active_field_keys.items():
                     if field == "age":
                         age_bin = self.get_age_bin(meta.get(json_key))
@@ -196,17 +194,28 @@ class MPDataset(Dataset):
                         if val == "":
                             val = "<UNK>"
                         idx = self.vocab[field].get(val, self.UNK_IDX)
-                    field_lists[field].append(idx)
+                    annotator_demog_ids[field] = idx
 
-            for field in self.active_field_keys:
-                if not field_lists[field]:
-                    field_lists[field] = [self.UNK_IDX]
+                # Add this annotator's example
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store single demographic IDs for this annotator
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(annotator_demog_ids[field])
 
-            self.texts.append(full_text)
-            self.dists.append(dist)
-            self.labels.append(hard_label)
-            for field in self.active_field_keys:
-                self.demographic_ids[field].append(field_lists[field])
+            # If no annotators, create one example with UNK demographic info
+            if not ann_list:
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store UNK demographic IDs
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(self.UNK_IDX)
+
+        print(f"Dataset created with {len(self.texts)} examples (expanded from {len(data)} original examples)")
 
     def __len__(self):
         return len(self.labels)
@@ -233,16 +242,8 @@ class MPDataset(Dataset):
         return result
 
 
-def _pad_list_tensors(list_of_1d):
-    max_len = max(x.size(0) for x in list_of_1d)
-    out = torch.zeros((len(list_of_1d), max_len), dtype=torch.long)
-    for i, t in enumerate(list_of_1d):
-        out[i, : t.size(0)] = t
-    return out
-
-
 def collate_fn(batch):
-    """Pads text and demographic index lists."""
+    """Pads text and handles single demographic values."""
 
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
@@ -259,13 +260,14 @@ def collate_fn(batch):
         "dist": dists,
     }
     
-    # Dynamically handle demographic fields
+    # Dynamically handle demographic fields - now single values, not lists
     demographic_keys = [k for k in batch[0].keys() 
                         if k.endswith("_ids") and k not in ["input_ids"]]
     for key in demographic_keys:
         tensors = [b[key] for b in batch]
-        padded = _pad_list_tensors(tensors)
-        result[key] = padded
+        # Stack single values instead of padding lists
+        stacked = torch.stack(tensors)
+        result[key] = stacked
 
     return result
 
@@ -474,6 +476,8 @@ def train(args):
     print(f"Training samples: {len(train_ds)}")
     if val_ds:
         print(f"Validation samples: {len(val_ds)}")
+    print(f"Using reduced demographic fields: {list(train_ds.active_field_keys.keys())}")
+    print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
 
     sampler = build_sampler(train_ds.labels) if args.balance else None
     train_loader = DataLoader(
