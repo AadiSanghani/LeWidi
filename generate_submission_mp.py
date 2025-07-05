@@ -8,6 +8,25 @@ from transformers import AutoTokenizer
 from train_roberta_mp import MPDemogModel
 
 
+def get_age_bin(age):
+    """Convert age to age bin."""
+    if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
+        return "<UNK>"
+    try:
+        age = float(age)
+        if age < 25:
+            return "18-24"
+        elif age < 35:
+            return "25-34"
+        elif age < 45:
+            return "35-44"
+        elif age < 55:
+            return "45-54"
+        else:
+            return "55+"
+    except (ValueError, TypeError):
+        return "<UNK>"
+
 def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
     """Recreate the input string exactly like during training."""
     post = example["text"].get("post", "")
@@ -18,14 +37,17 @@ def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
 
 
 def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
-    """Process demographic data for a single example."""
+    """Process demographic data for a single example - matches training script logic."""
     PAD_IDX = 0
     UNK_IDX = 1
     
+    # Use the same reduced field set as training script
     FIELD_KEYS = {
-        "country": "Country of residence",
-        "employment": "Employment status", 
+        "age": "Age",  # Will be binned
+        "gender": "Gender", 
         "ethnicity": "Ethnicity simplified",
+        "country_residence": "Country of residence",
+        "employment": "Employment status",
     }
     
     ann_str = example.get("annotators", "")
@@ -33,20 +55,31 @@ def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
     if not ann_list:
         ann_list = []
 
-    field_lists = {field: [] for field in FIELD_KEYS}
-    for ann_tag in ann_list:
+    # For submission, we need to handle multiple annotators
+    # We'll use the first annotator's demographics or UNK if no annotators
+    if ann_list:
+        # Use first annotator's demographics
+        ann_tag = ann_list[0]
         ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
         meta = annot_meta.get(ann_num, {})
+        
+        demographic_ids = {}
         for field, json_key in FIELD_KEYS.items():
-            val = str(meta.get(json_key, "")).strip()
-            idx = vocab[field].get(val, UNK_IDX)
-            field_lists[field].append(idx)
-
-    for field in FIELD_KEYS:
-        if not field_lists[field]:
-            field_lists[field] = [UNK_IDX]
+            if field == "age":
+                # Special handling for age - convert to age bin
+                age_bin = get_age_bin(meta.get(json_key))
+                idx = vocab[field].get(age_bin, UNK_IDX)
+            else:
+                val = str(meta.get(json_key, "")).strip()
+                if val == "":
+                    val = "<UNK>"
+                idx = vocab[field].get(val, UNK_IDX)
+            demographic_ids[field] = idx
+    else:
+        # No annotators - use UNK for all fields
+        demographic_ids = {field: UNK_IDX for field in FIELD_KEYS}
             
-    return field_lists
+    return demographic_ids
 
 
 def main(args):
@@ -58,11 +91,13 @@ def main(args):
     with open(args.annot_meta, "r", encoding="utf-8") as f:
         annot_meta = json.load(f)
     
-    # Build vocabulary from annotator metadata
+    # Build vocabulary from annotator metadata - matches training script
     FIELD_KEYS = {
-        "country": "Country of residence",
-        "employment": "Employment status",
+        "age": "Age",  # Will be binned
+        "gender": "Gender", 
         "ethnicity": "Ethnicity simplified",
+        "country_residence": "Country of residence",
+        "employment": "Employment status",
     }
     
     vocab = {
@@ -70,13 +105,20 @@ def main(args):
         for field in FIELD_KEYS
     }
 
+    # Build vocabulary from all annotators
     for ann_data in annot_meta.values():
         for field, json_key in FIELD_KEYS.items():
-            val = str(ann_data.get(json_key, "")).strip()
-            if val == "":
-                continue
-            if val not in vocab[field]:
-                vocab[field][val] = len(vocab[field])
+            if field == "age":
+                # Special handling for age - convert to age bin
+                age_bin = get_age_bin(ann_data.get(json_key))
+                if age_bin not in vocab[field]:
+                    vocab[field][age_bin] = len(vocab[field])
+            else:
+                val = str(ann_data.get(json_key, "")).strip()
+                if val == "":
+                    val = "<UNK>"
+                if val not in vocab[field]:
+                    vocab[field][val] = len(vocab[field])
 
     vocab_sizes = {field: len(v) for field, v in vocab.items()}
     
@@ -109,18 +151,17 @@ def main(args):
             # Process demographic data
             dem_data = process_demographic_data(ex, annot_meta, vocab)
             
-            # Convert to tensors and pad
-            country_ids = torch.tensor([dem_data["country"]], dtype=torch.long).to(device)
-            employment_ids = torch.tensor([dem_data["employment"]], dtype=torch.long).to(device)
-            ethnicity_ids = torch.tensor([dem_data["ethnicity"]], dtype=torch.long).to(device)
+            # Convert to tensors - now single values, not lists
+            demographic_inputs = {}
+            for field in FIELD_KEYS:
+                field_key = f"{field}_ids"
+                demographic_inputs[field_key] = torch.tensor([dem_data[field]], dtype=torch.long).to(device)
             
             with torch.no_grad():
                 logits = model(
                     input_ids=enc["input_ids"],
                     attention_mask=enc["attention_mask"],
-                    country_ids=country_ids,
-                    employment_ids=employment_ids,
-                    ethnicity_ids=ethnicity_ids
+                    **demographic_inputs
                 )
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
@@ -160,12 +201,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate submission TSV for MP dataset (Task A or B).")
     parser.add_argument("--model_dir", type=str, required=True, help="Path to fine-tuned model directory")
     parser.add_argument("--base_model_name", type=str, default="roberta-large", help="Base model name (e.g., roberta-large)")
-    parser.add_argument("--test_file", type=str, required=True, help="Path to *_test_clear.json file")
+    parser.add_argument("--test_file", type=str, default="dataset/MP/MP_test_clear.json", help="Path to *_test_clear.json file")
     parser.add_argument("--annot_meta", type=str, default="dataset/MP/MP_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--task", choices=["A", "B"], default="A", help="Which task: A (soft) or B (perspectivist)")
     parser.add_argument("--output_tsv", type=str, default=None, help="Optional output filename")
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--dem_dim", type=int, default=16, help="Dimension of each demographic embedding")
+    parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
     args = parser.parse_args()
     main(args) 
