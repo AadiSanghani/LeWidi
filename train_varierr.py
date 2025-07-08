@@ -276,6 +276,86 @@ def main():
             print(f"Manhattan Distance Score: {manhattan_score:.4f}")
         print(f"Model saved to {save_path}")
 
+def generate_submission_files():
+    """Generate Codabench submission files for VariErrNLI dataset using trained models."""
+    import json
+    from tqdm import tqdm
+    # Configuration for VariErrNLI dataset
+    test_file = 'dataset/VariErrNLI/VariErrNLI_dev.json'  # Use dev for testing, change to test when available
+    max_length = 512
+    num_bins = 3  # Contradiction, Entailment, Neutral
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Load test data
+    with open(test_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = list(data.values())
+    # Generate Task A (Soft Label) submission
+    print("Generating Task A (Soft Label) submission...")
+    soft_model_path = 'models/varierrnli_soft_label_sbert'
+    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='soft_label')
+    trainer = LeWiDiTrainer(model)
+    trainer.load_model(soft_model_path)
+    model.to(device)
+    model.eval()
+    output_file = 'VariErrNLI_test_soft.tsv'
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task A predictions"):
+            context = ex['text']['context']
+            statement = ex['text']['statement']
+            text = f"{context} [SEP] {statement}"
+            with torch.no_grad():
+                outputs = model([text])
+                probs = outputs['predictions'].squeeze(0).cpu()
+            out_probs = probs.tolist()
+            if len(out_probs) < num_bins:
+                pad = [0.0] * (num_bins - len(out_probs))
+                out_probs = pad + out_probs
+            out_probs = [round(p, 10) for p in out_probs]
+            drift = 1.0 - sum(out_probs)
+            if abs(drift) > 1e-10:
+                idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
+                out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+            prob_str = ",".join(f"{p:.10f}" for p in out_probs)
+            out_f.write(f"{idx}\t[{prob_str}]\n")
+    print(f"Saved Task A submission file to {output_file}")
+    # Generate Task B (Perspectivist) submission
+    print("Generating Task B (Perspectivist) submission...")
+    pe_model_path = 'models/varierrnli_perspectivist_sbert'
+    model_pe = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
+    trainer_pe = LeWiDiTrainer(model_pe)
+    trainer_pe.load_model(pe_model_path)
+    model_pe.to(device)
+    model_pe.eval()
+    output_file_pe = 'VariErrNLI_test_pe.tsv'
+    with open(output_file_pe, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task B predictions"):
+            context = ex['text']['context']
+            statement = ex['text']['statement']
+            text = f"{context} [SEP] {statement}"
+            ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
+            with torch.no_grad():
+                outputs = model_pe([text])
+                preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
+            annotator_preds = []
+            if isinstance(preds, torch.Tensor) and preds.ndim == 2:
+                n_annotators = min(len(ann_list), preds.shape[0])
+                for i in range(n_annotators):
+                    label_idx = torch.argmax(preds[i]).item()
+                    label = NLI_LABELS[int(label_idx)]
+                    annotator_preds.append(label)
+            elif isinstance(preds, torch.Tensor) and preds.ndim == 1:
+                # fallback: treat as one annotator
+                label_idx = torch.argmax(preds).item()
+                label = NLI_LABELS[int(label_idx)]
+                annotator_preds.append(label)
+            preds_str = ", ".join(annotator_preds)
+            out_f.write(f"{idx}\t[{preds_str}]\n")
+    print(f"Saved Task B submission file to {output_file_pe}")
+    print("To submit: zip -j res.zip", output_file, output_file_pe)
+
 if __name__ == "__main__":
     main()
+    # Uncomment to generate submission files after training:
+    # generate_submission_files()
     # predict_example()  # Uncomment to run example inference 
