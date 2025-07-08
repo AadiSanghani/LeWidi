@@ -342,12 +342,20 @@ def generate_submission_files():
                 n_annotators = min(len(ann_list), preds.shape[0])
                 for i in range(n_annotators):
                     label_idx = torch.argmax(preds[i]).item()
-                    label = NLI_LABELS[int(label_idx)]
+                    label_idx = int(label_idx)
+                    if 0 <= label_idx < len(NLI_LABELS):
+                        label = NLI_LABELS[label_idx]
+                    else:
+                        label = "UNK"
                     annotator_preds.append(label)
             elif isinstance(preds, torch.Tensor) and preds.ndim == 1:
                 # fallback: treat as one annotator
                 label_idx = torch.argmax(preds).item()
-                label = NLI_LABELS[int(label_idx)]
+                label_idx = int(label_idx)
+                if 0 <= label_idx < len(NLI_LABELS):
+                    label = NLI_LABELS[label_idx]
+                else:
+                    label = "UNK"
                 annotator_preds.append(label)
             preds_str = ", ".join(annotator_preds)
             out_f.write(f"{idx}\t[{preds_str}]\n")
