@@ -2,17 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import RobertaTokenizer, RobertaModel, get_linear_schedule_with_warmup
+from sentence_transformers import SentenceTransformer
 import os
 from typing import List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-class Par_VariErrNLI(Dataset):
-    """Dataset class for Par and VariErrNLI datasets"""
-    def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
+MAX_ANNOTATORS = 5  # Maximum number of annotators for VariErrNLI
+NLI_LABELS = ["contradiction", "entailment", "neutral"]
+NLI_LABEL2IDX = {label: idx for idx, label in enumerate(NLI_LABELS)}
+
+class VariErrNLI_Dataset(Dataset):
+    """Dataset class for VariErrNLI dataset"""
+    def __init__(self, data_path: str, max_length: int = 512, 
                  dataset_type: str = "varierrnli", task_type: str = "soft_label"):
-        self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_type = dataset_type
         self.task_type = task_type
@@ -44,35 +47,53 @@ class Par_VariErrNLI(Dataset):
         # Not used in this script
         return {}
     def process_varierrnli_item(self, item):
-        if isinstance(item, dict):
-            premise = item.get('premise', '')
-            hypothesis = item.get('hypothesis', '')
-            annotations = item.get('annotations', [])
-            annotator_ids = item.get('annotator_ids', [])
-        else:
-            premise = item['premise']
-            hypothesis = item['hypothesis']
-            annotations = eval(item['annotations']) if isinstance(item['annotations'], str) else item['annotations']
-            annotator_ids = eval(item['annotator_ids']) if isinstance(item['annotator_ids'], str) else item['annotator_ids']
-        text = f"{premise} [SEP] {hypothesis}"
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
+        context = item['text']['context']
+        statement = item['text']['statement']
+        text = f"{context} [SEP] {statement}"
         if self.task_type == "soft_label":
-            soft_label = self.create_soft_label(annotations, scale_range=(-5, 6), categorical=True)
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            annotations_dict = item['annotations']
+            multi_hot_vectors = []
+            for ann in annotator_list:
+                label_str = annotations_dict[ann]
+                label_vec = [0, 0, 0]
+                for label in label_str.split(','):
+                    label = label.strip()
+                    if label in NLI_LABEL2IDX:
+                        label_vec[NLI_LABEL2IDX[label]] = 1
+                multi_hot_vectors.append(label_vec)
+            if multi_hot_vectors:
+                soft_label = torch.tensor(multi_hot_vectors, dtype=torch.float).mean(dim=0)
+            else:
+                soft_label = torch.zeros(3, dtype=torch.float)
+            labels = soft_label
+            annotator_ids = []
         else:
-            soft_label = torch.tensor(annotations, dtype=torch.float)
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            annotations_dict = item['annotations']
+            annotator_labels = []
+            for ann in annotator_list:
+                label_str = annotations_dict[ann]
+                label_vec = [0, 0, 0]
+                for label in label_str.split(','):
+                    label = label.strip()
+                    if label in NLI_LABEL2IDX:
+                        label_vec[NLI_LABEL2IDX[label]] = 1
+                annotator_labels.append(label_vec)
+            # Truncate if too many annotators, pad if too few
+            if len(annotator_labels) > MAX_ANNOTATORS:
+                annotator_labels = annotator_labels[:MAX_ANNOTATORS]
+            while len(annotator_labels) < MAX_ANNOTATORS:
+                annotator_labels.append([-100, -100, -100])
+            labels = torch.tensor(annotator_labels, dtype=torch.float)
+            annotator_ids = []
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': soft_label,
-            'annotator_ids': torch.tensor(annotator_ids) if annotator_ids else torch.tensor([])
+            'text': text,
+            'labels': labels,
+            'annotator_ids': torch.tensor([])
         }
     def create_soft_label(self, annotations: List, scale_range: Tuple[int, int], categorical: bool = False):
+        # Not used anymore, but kept for compatibility
         num_classes = scale_range[1] - scale_range[0]
         soft_label = torch.zeros(num_classes)
         for ann in annotations:
@@ -86,45 +107,51 @@ class Par_VariErrNLI(Dataset):
             soft_label = soft_label / soft_label.sum()
         return soft_label
 
-class RoBERTaForLeWiDi(nn.Module):
+class SBertForLeWiDi(nn.Module):
     def __init__(self, model_name: str, num_classes: int, task_type: str = "soft_label",
-                 num_annotators: Optional[int] = None):
-        super(RoBERTaForLeWiDi, self).__init__()
+                 num_annotators: Optional[int] = None, embedding_dim: int = 256):
+        super(SBertForLeWiDi, self).__init__()
         self.task_type = task_type
         self.num_classes = num_classes
         self.num_annotators = num_annotators
-        self.roberta = RobertaModel.from_pretrained(model_name)
+        self.sbert = SentenceTransformer(model_name)
         self.dropout = nn.Dropout(0.1)
+        emb_dim = self.sbert.get_sentence_embedding_dimension()
+        if emb_dim is None:
+            raise ValueError("SBert model did not return a valid embedding dimension.")
+        emb_dim = int(emb_dim)
+        self.embedding = nn.Linear(emb_dim, embedding_dim)
         if task_type == "soft_label":
-            self.classifier = nn.Linear(self.roberta.config.hidden_size, num_classes)
+            self.classifier = nn.Linear(embedding_dim, num_classes)
         else:
             if num_annotators is None:
                 raise ValueError("num_annotators must be provided for perspectivist task_type.")
-            self.classifier = nn.Linear(self.roberta.config.hidden_size, num_classes * num_annotators)
-    def forward(self, input_ids, attention_mask, labels=None, annotator_ids=None):
-        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.pooler_output
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+            self.classifier = nn.Linear(embedding_dim, num_classes * num_annotators)
+    def forward(self, texts, labels=None, annotator_ids=None):
+        embeddings = self.sbert.encode(texts, convert_to_tensor=True)
+        x = self.dropout(embeddings)
+        x = self.embedding(x)
+        x = self.dropout(x)
+        logits = self.classifier(x)
         loss = None
         if labels is not None:
             if self.task_type == "soft_label":
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = F.kl_div(log_probs, labels, reduction='batchmean')
+                loss = F.binary_cross_entropy_with_logits(logits, labels)
             else:
                 logits = logits.view(-1, self.num_annotators, self.num_classes)
-                loss = F.cross_entropy(logits.view(-1, self.num_classes), 
-                                     labels.long().view(-1), ignore_index=-100)
+                mask = (labels != -100)
+                valid_logits = logits[mask].view(-1, self.num_classes)
+                valid_labels = labels[mask].view(-1, self.num_classes)
+                loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
         return {
             'loss': loss,
             'logits': logits,
-            'predictions': F.softmax(logits, dim=-1) if self.task_type == "soft_label" else logits
+            'predictions': torch.sigmoid(logits)
         }
 
 class LeWiDiTrainer:
-    def __init__(self, model, tokenizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.model = model
-        self.tokenizer = tokenizer
         self.device = device
         self.model.to(device)
     def train(self, train_dataloader, val_dataloader, epochs=3, learning_rate=2e-5,
@@ -132,21 +159,18 @@ class LeWiDiTrainer:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         total_steps = len(train_dataloader) * epochs
         warmup_steps = int(total_steps * warmup_steps) if warmup_steps < 1 else warmup_steps
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
         self.model.train()
         best_val_loss = float('inf')
         for epoch in range(epochs):
             total_loss = 0
             for batch_idx, batch in enumerate(train_dataloader):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
                 annotator_ids = batch.get('annotator_ids', None)
                 if annotator_ids is not None:
                     annotator_ids = annotator_ids.to(self.device)
-                outputs = self.model(input_ids, attention_mask, labels, annotator_ids)
+                outputs = self.model(texts, labels, annotator_ids)
                 loss = outputs['loss']
                 optimizer.zero_grad()
                 loss.backward()
@@ -169,13 +193,12 @@ class LeWiDiTrainer:
         total_loss = 0
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
                 annotator_ids = batch.get('annotator_ids', None)
                 if annotator_ids is not None:
                     annotator_ids = annotator_ids.to(self.device)
-                outputs = self.model(input_ids, attention_mask, labels, annotator_ids)
+                outputs = self.model(texts, labels, annotator_ids)
                 total_loss += outputs['loss'].item()
         self.model.train()
         return total_loss / len(dataloader)
@@ -185,10 +208,9 @@ class LeWiDiTrainer:
         total_samples = 0
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
-                outputs = self.model(input_ids, attention_mask)
+                outputs = self.model(texts)
                 predictions = outputs['predictions']
                 manhattan_dist = torch.sum(torch.abs(predictions - labels), dim=1)
                 total_distance += manhattan_dist.sum().item()
@@ -198,18 +220,15 @@ class LeWiDiTrainer:
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
         torch.save(self.model.state_dict(), os.path.join(path, 'model.pt'))
-        self.tokenizer.save_pretrained(path)
     def load_model(self, path):
         self.model.load_state_dict(torch.load(os.path.join(path, 'model.pt')))
 
 def main():
-    MODEL_NAME = 'roberta-base'
+    MODEL_NAME = 'all-MiniLM-L6-v2'  # SBert model
     MAX_LENGTH = 512
     BATCH_SIZE = 16
     EPOCHS = 3
     LEARNING_RATE = 2e-5
-
-    tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
 
     config = {
         'num_classes': 3,  # Entailment, Neutral, Contradiction
@@ -223,26 +242,31 @@ def main():
         print(f"Training on VARIERRNLI dataset - Task Type: {task_type}")
         print(f"{'='*50}")
 
-        train_dataset = Par_VariErrNLI(
-            config['train_path'], tokenizer, MAX_LENGTH, 'varierrnli', task_type
+        train_dataset = VariErrNLI_Dataset(
+            config['train_path'], MAX_LENGTH, 'varierrnli', task_type
         )
-        val_dataset = Par_VariErrNLI(
-            config['val_path'], tokenizer, MAX_LENGTH, 'varierrnli', task_type
+        val_dataset = VariErrNLI_Dataset(
+            config['val_path'], MAX_LENGTH, 'varierrnli', task_type
         )
+
+        def collate_fn(batch):
+            texts = [item['text'] for item in batch]
+            labels = torch.stack([item['labels'] for item in batch])
+            return {'text': texts, 'labels': labels}
 
         train_dataloader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn
         )
         val_dataloader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
         )
 
-        num_annotators = 10 if task_type == 'perspectivist' else None
-        model = RoBERTaForLeWiDi(
+        num_annotators = MAX_ANNOTATORS if task_type == 'perspectivist' else None
+        model = SBertForLeWiDi(
             MODEL_NAME, config['num_classes'], task_type, num_annotators
         )
-        trainer = LeWiDiTrainer(model, tokenizer)
-        save_path = f'models/varierrnli_{task_type}_roberta'
+        trainer = LeWiDiTrainer(model)
+        save_path = f'models/varierrnli_{task_type}_sbert'
         trainer.train(
             train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
             save_path=save_path
@@ -252,27 +276,94 @@ def main():
             print(f"Manhattan Distance Score: {manhattan_score:.4f}")
         print(f"Model saved to {save_path}")
 
-def predict_example():
-    """Example prediction function for VariErrNLI"""
-    tokenizer = RobertaTokenizer.from_pretrained('models/varierrnli_soft_label_roberta')
-    model = RoBERTaForLeWiDi('roberta-base', num_classes=3, task_type='soft_label')
-    trainer = LeWiDiTrainer(model, tokenizer)
-    trainer.load_model('models/varierrnli_soft_label_roberta')
-    premise = "The cat is on the mat."
-    hypothesis = "A cat is lying on a rug."
-    text = f"{premise} [SEP] {hypothesis}"
-    encoding = tokenizer(
-        text, truncation=True, padding='max_length', 
-        max_length=512, return_tensors='pt'
-    )
+def generate_submission_files():
+    """Generate Codabench submission files for VariErrNLI dataset using trained models."""
+    import json
+    from tqdm import tqdm
+    # Configuration for VariErrNLI dataset
+    test_file = 'dataset/VariErrNLI/VariErrNLI_dev.json'  # Use dev for testing, change to test when available
+    max_length = 512
+    num_bins = 3  # Contradiction, Entailment, Neutral
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Load test data
+    with open(test_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = list(data.values())
+    # Generate Task A (Soft Label) submission
+    print("Generating Task A (Soft Label) submission...")
+    soft_model_path = 'models/varierrnli_soft_label_sbert'
+    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='soft_label')
+    trainer = LeWiDiTrainer(model)
+    trainer.load_model(soft_model_path)
+    model.to(device)
     model.eval()
-    with torch.no_grad():
-        outputs = model(encoding['input_ids'], encoding['attention_mask'])
-        predictions = outputs['predictions']
-    print(f"Soft label distribution: {predictions.numpy()}")
-    predicted_class = torch.argmax(predictions, dim=-1).item()
-    print(f"Most likely class: {predicted_class}")
+    output_file = 'VariErrNLI_test_soft.tsv'
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task A predictions"):
+            context = ex['text']['context']
+            statement = ex['text']['statement']
+            text = f"{context} [SEP] {statement}"
+            with torch.no_grad():
+                outputs = model([text])
+                probs = outputs['predictions'].squeeze(0).cpu()
+            out_probs = probs.tolist()
+            if len(out_probs) < num_bins:
+                pad = [0.0] * (num_bins - len(out_probs))
+                out_probs = pad + out_probs
+            out_probs = [round(p, 10) for p in out_probs]
+            drift = 1.0 - sum(out_probs)
+            if abs(drift) > 1e-10:
+                idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
+                out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+            prob_str = ",".join(f"{p:.10f}" for p in out_probs)
+            out_f.write(f"{idx}\t[{prob_str}]\n")
+    print(f"Saved Task A submission file to {output_file}")
+    # Generate Task B (Perspectivist) submission
+    print("Generating Task B (Perspectivist) submission...")
+    pe_model_path = 'models/varierrnli_perspectivist_sbert'
+    model_pe = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
+    trainer_pe = LeWiDiTrainer(model_pe)
+    trainer_pe.load_model(pe_model_path)
+    model_pe.to(device)
+    model_pe.eval()
+    output_file_pe = 'VariErrNLI_test_pe.tsv'
+    with open(output_file_pe, "w", encoding="utf-8") as out_f:
+        for idx, ex in tqdm(enumerate(data), desc="Task B predictions"):
+            context = ex['text']['context']
+            statement = ex['text']['statement']
+            text = f"{context} [SEP] {statement}"
+            ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
+            with torch.no_grad():
+                outputs = model_pe([text])
+                preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
+            annotator_preds = []
+            if isinstance(preds, torch.Tensor) and preds.ndim == 2:
+                n_annotators = min(len(ann_list), preds.shape[0])
+                for i in range(n_annotators):
+                    label_idx = torch.argmax(preds[i]).item()
+                    label_idx = int(label_idx)
+                    if 0 <= label_idx < len(NLI_LABELS):
+                        label = NLI_LABELS[label_idx]
+                    else:
+                        label = "UNK"
+                    annotator_preds.append(label)
+            elif isinstance(preds, torch.Tensor) and preds.ndim == 1:
+                # fallback: treat as one annotator
+                label_idx = torch.argmax(preds).item()
+                label_idx = int(label_idx)
+                if 0 <= label_idx < len(NLI_LABELS):
+                    label = NLI_LABELS[label_idx]
+                else:
+                    label = "UNK"
+                annotator_preds.append(label)
+            preds_str = ", ".join(annotator_preds)
+            out_f.write(f"{idx}\t[{preds_str}]\n")
+    print(f"Saved Task B submission file to {output_file_pe}")
+    print("To submit: zip -j res.zip", output_file, output_file_pe)
 
 if __name__ == "__main__":
     main()
+    # Uncomment to generate submission files after training:
+    # generate_submission_files()
     # predict_example()  # Uncomment to run example inference 
