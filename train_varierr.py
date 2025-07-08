@@ -245,26 +245,23 @@ class SBertForLeWiDi(nn.Module):
         embeddings = self.sbert.encode(texts, convert_to_tensor=True)
         
         if self.use_demographics and self.task_type == "perspectivist" and demographic_embeddings is not None:
-            # Concatenate text embeddings with demographic embeddings
+            # For perspectivist with demographics, we need to handle each sample-annotator pair
             batch_size = embeddings.shape[0]
-            # Reshape demographic embeddings to match batch size
-            if demographic_embeddings.dim() == 3:  # [batch, num_annotators, dem_dim]
-                # For perspectivist, we need to process each annotator separately
-                combined_embeddings = []
-                num_annotators = self.num_annotators or MAX_ANNOTATORS
-                for i in range(batch_size):
-                    for j in range(num_annotators):
-                        if demographic_embeddings[i, j].sum() != 0:  # Valid annotator
-                            combined = torch.cat([embeddings[i], demographic_embeddings[i, j]])
-                            combined_embeddings.append(combined)
-                        else:
-                            # Padding annotator
-                            combined = torch.cat([embeddings[i], torch.zeros(64, device=embeddings.device)])
-                            combined_embeddings.append(combined)
-                embeddings = torch.stack(combined_embeddings)
-            else:
-                # Fallback: just use text embeddings
-                pass
+            num_annotators = self.num_annotators or MAX_ANNOTATORS
+            
+            # Expand text embeddings to match annotator dimension
+            # embeddings: [batch_size, emb_dim] -> [batch_size * num_annotators, emb_dim]
+            expanded_embeddings = embeddings.unsqueeze(1).expand(-1, num_annotators, -1)
+            expanded_embeddings = expanded_embeddings.reshape(-1, embeddings.shape[-1])
+            
+            # Reshape demographic embeddings: [batch_size, num_annotators, dem_dim] -> [batch_size * num_annotators, dem_dim]
+            demographic_flat = demographic_embeddings.reshape(-1, demographic_embeddings.shape[-1])
+            
+            # Concatenate text and demographic embeddings
+            embeddings = torch.cat([expanded_embeddings, demographic_flat], dim=1)
+        else:
+            # For soft_label or no demographics, use original embeddings
+            pass
         
         x = self.dropout(embeddings)
         x = self.embedding(x)
