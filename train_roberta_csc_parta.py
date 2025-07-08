@@ -8,94 +8,89 @@ import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
+import torch.nn as nn
 
+# source myenv/bin/activate
 
 class CSCDataset(Dataset):
-    """PyTorch dataset for the CSC sarcasm-detection data"""
-
-    def __init__(self, path: str, tokenizer: AutoTokenizer, max_length: int = 128, n_bins: int = 7):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.texts = []
+    def __init__(self, path: str, tokenizer: AutoTokenizer, max_length: int = 128, n_bins: int = 6):
+        self.contexts = []
+        self.responses = []
         self.labels = []
         self.dists = []
+        self.raw_annotations = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
         self.n_bins = n_bins
 
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         for ex in data.values():
-            # Build input text.
-            context = ex["text"].get("context", "")
-            response = ex["text"].get("response", "")
-            if context:
-                full_text = f"{context} {tokenizer.sep_token} {response}"
-            else:
-                full_text = response
-
-            # Extract annotator ratings
-            ratings = [int(v) for v in ex["annotations"].values() if v]
+            context = ex["text"]["context"]
+            response = ex["text"]["response"]
+            ratings = [int(v) - 1 for v in ex["annotations"].values() if v]
             if not ratings:
-                # skip items with no labels
                 continue
 
-            # Use majority vote to assign a hard label (needed for the sampler only)
-            vote = Counter(ratings).most_common(1)[0][0]
-            label = vote - 1  # shift to 0-based
-
-            self.texts.append(full_text)
+            self.contexts.append(context)
+            self.responses.append(response)
+            label = max(set(ratings), key=ratings.count)
             self.labels.append(label)
-            # build soft distribution for Wasserstein training
-            dist = np.zeros(self.n_bins, dtype=np.float32)
+
+            dist = np.zeros(n_bins)
             for r in ratings:
-                idx = r if self.n_bins == 7 else r - 1  
-                if idx < self.n_bins:
-                    dist[idx] += 1.0
-            dist /= dist.sum()
-            self.dists.append(dist)
+                dist[r] += 1
+            dist /= len(ratings)
+            self.dists.append(dist.tolist())
+            self.raw_annotations.append(ratings)
+
+    def __getitem__(self, idx):
+        context = self.contexts[idx]
+        response = self.responses[idx]
+        enc_context = self.tokenizer(context, truncation=True, padding='max_length', max_length=self.max_length, return_tensors="pt")
+        enc_response = self.tokenizer(response, truncation=True, padding='max_length', max_length=self.max_length, return_tensors="pt")
+
+        item = {
+            "context_input_ids": enc_context["input_ids"].squeeze(0),
+            "context_attention_mask": enc_context["attention_mask"].squeeze(0),
+            "response_input_ids": enc_response["input_ids"].squeeze(0),
+            "response_attention_mask": enc_response["attention_mask"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+            "annotations": torch.tensor(self.raw_annotations[idx], dtype=torch.long),
+        }
+        return item
 
     def __len__(self):
         return len(self.labels)
 
-    def __getitem__(self, idx):
-        enc = self.tokenizer(
-            self.texts[idx],
-            max_length=self.max_length,
-            padding=False,
-            truncation=True,
-            return_tensors="pt",
-        )
-        item = {
-            "input_ids": enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
-            "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-        }
-        return item
 
 
 def collate_fn(batch):
-    """Pads a batch of variable-length encoded examples."""
-    input_ids = [x["input_ids"] for x in batch]
-    attn = [x["attention_mask"] for x in batch]
-    labels = torch.stack([x["labels"] for x in batch]) if "labels" in batch[0] else None
-    dists = torch.stack([x["dist"] for x in batch])
+    context_ids = pad_sequence([x["context_input_ids"] for x in batch], batch_first=True, padding_value=1)
+    context_mask = pad_sequence([x["context_attention_mask"] for x in batch], batch_first=True, padding_value=0)
+    response_ids = pad_sequence([x["response_input_ids"] for x in batch], batch_first=True, padding_value=1)
+    response_mask = pad_sequence([x["response_attention_mask"] for x in batch], batch_first=True, padding_value=0)
 
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
-    attn = pad_sequence(attn, batch_first=True, padding_value=0)
+    labels = torch.stack([x["labels"] for x in batch])
+    dists = torch.stack([x["dist"] for x in batch])
+    annotations = [x["annotations"] for x in batch]
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attn,
+        "context_input_ids": context_ids,
+        "context_attention_mask": context_mask,
+        "response_input_ids": response_ids,
+        "response_attention_mask": response_mask,
         "labels": labels,
         "dist": dists,
+        "annotations": annotations,
     }
-
 
 def build_sampler(labels):
     """Returns a WeightedRandomSampler to alleviate class imbalance."""
@@ -107,23 +102,48 @@ def build_sampler(labels):
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 
+class RobertaFusionModel(nn.Module):
+    def __init__(self, model_name="roberta-base", num_bins=6):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.hidden_size = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size, num_bins)
+        )
+
+    def forward(self, context_input_ids, context_attention_mask, response_input_ids, response_attention_mask):
+        context_output = self.encoder(input_ids=context_input_ids, attention_mask=context_attention_mask).last_hidden_state[:, 0, :]
+        response_output = self.encoder(input_ids=response_input_ids, attention_mask=response_attention_mask).last_hidden_state[:, 0, :]
+        combined = torch.cat([context_output, response_output], dim=1)
+        logits = self.classifier(self.dropout(combined))
+        return logits
+
+
 def evaluate(model, dataloader, device):
-    """Return mean 1-D Wasserstein distance over the dataloader."""
     model.eval()
     total_dist = 0.0
     n_examples = 0
     with torch.no_grad():
         for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
-
+            for k in batch:
+                if isinstance(batch[k], torch.Tensor):
+                    batch[k] = batch[k].to(device)
+            logits = model(
+                batch["context_input_ids"],
+                batch["context_attention_mask"],
+                batch["response_input_ids"],
+                batch["response_attention_mask"]
+            )
             p_hat = torch.softmax(logits, dim=-1)
             cdf_hat = torch.cumsum(p_hat, dim=-1)
             cdf_true = torch.cumsum(batch["dist"], dim=-1)
             dist = torch.sum(torch.abs(cdf_hat - cdf_true), dim=-1)
             total_dist += dist.sum().item()
             n_examples += dist.numel()
-
     return total_dist / n_examples if n_examples else 0.0
 
 
@@ -149,7 +169,7 @@ def train(args):
         else None
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=args.num_bins)
+    model = RobertaFusionModel(args.model_name, args.num_bins)
     model.to(device)
 
     # Optimiser & scheduler
@@ -191,9 +211,13 @@ def train(args):
         step = 0
         prog = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for batch in prog:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
-
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            logits = model(
+                context_input_ids=batch["context_input_ids"],
+                context_attention_mask=batch["context_attention_mask"],
+                response_input_ids=batch["response_input_ids"],
+                response_attention_mask=batch["response_attention_mask"]
+            )
             # Wasserstein loss between predicted and true distributions
             p_hat = torch.softmax(logits, dim=-1)
             cdf_hat = torch.cumsum(p_hat, dim=-1)
@@ -221,7 +245,8 @@ def train(args):
             if improve:
                 best_acc = val_dist
                 save_path = os.path.join(args.output_dir, "best_model")
-                model.save_pretrained(save_path)
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
                 tokenizer.save_pretrained(save_path)
                 print(f"Saved new best model to {save_path}")
 
@@ -232,8 +257,9 @@ def train(args):
         lr_history.append(optimiser.param_groups[0]['lr'])
 
     # Save final checkpoint
-    model.save_pretrained(os.path.join(args.output_dir, "last_model"))
-    tokenizer.save_pretrained(os.path.join(args.output_dir, "last_model"))
+    torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
+    tokenizer.save_pretrained(save_path)
+
 
     # Plot metrics with explicit epoch indices
     epochs_range = list(range(1, len(train_loss_history) + 1))
@@ -281,17 +307,24 @@ if __name__ == "__main__":
     parser.add_argument("--val_file", type=str, default=None, help="Path to CSC_dev.json")
     parser.add_argument("--model_name", type=str, default="roberta-base", help="HF model name")
     parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.06)
-    parser.add_argument("--balance", action="store_true", help="If set, use WeightedRandomSampler to mitigate class imbalance.")
-    parser.add_argument("--num_bins", type=int, default=7, help="Number of label bins (e.g. 7 if ratings 0-6, 6 if 1-6).")
-    parser.add_argument("--lr_decay_steps", type=int, default=1000, help="Optimizer steps between LR decays after warmup.")
-    parser.add_argument("--lr_decay_gamma", type=float, default=0.9, help="Gamma for learning rate decay")
-    parser.add_argument("--lambda_ce", type=float, default=0.3, help="Weight for cross-entropy in mixed loss (0 means pure Wasserstein).")
 
+    parser.add_argument("--max_length", type=int, default=128, help="Max token length for context/response")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size (adjust if using roberta-large)")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (use if batch_size is low)")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+
+    parser.add_argument("--lr", type=float, default=2e-5, help="Initial learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW")
+    parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warmup proportion of total steps")
+
+    parser.add_argument("--balance", action="store_true", help="If set, use class-balancing sampler for training")
+    parser.add_argument("--num_bins", type=int, default=6, help="Number of label bins (6 for ratings 1–6, shifted to 0–5)")
+
+    parser.add_argument("--lr_decay_steps", type=int, default=1000, help="Optimizer steps between LR decays after warmup")
+    parser.add_argument("--lr_decay_gamma", type=float, default=0.9, help="LR decay factor after every decay step")
+
+    parser.add_argument("--lambda_ce", type=float, default=0.05, help="Weight for cross-entropy loss (0 = only Wasserstein)")
+
+    parser.add_argument("--fp16", action="store_true", help="Enable mixed precision (saves memory, speeds up training)")
     args = parser.parse_args()
     train(args) 
