@@ -30,7 +30,11 @@ class DemographicsEncoder:
         
     def load_metadata(self, metadata_path: str) -> Dict:
         with open(metadata_path, 'r') as f:
-            return json.load(f)
+            content = f.read()
+            # Handle trailing commas in JSON by removing them
+            import re
+            content = re.sub(r',(\s*[}\]])', r'\1', content)
+            return json.loads(content)
     
     def create_nationality_map(self) -> Dict[str, int]:
         nationalities = set()
