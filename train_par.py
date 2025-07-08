@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import RobertaTokenizer, RobertaModel, get_linear_schedule_with_warmup
+from sentence_transformers import SentenceTransformer
 import os
 from typing import List, Tuple, Optional
 import warnings
@@ -20,9 +20,8 @@ MAX_ANNOTATORS = 5  # Maximum number of annotators for Paraphrase dataset
 
 class Par_Dataset(Dataset):
     """Dataset class for Par dataset"""
-    def __init__(self, data_path: str, tokenizer, max_length: int = 512, 
+    def __init__(self, data_path: str, max_length: int = 512, 
                  dataset_type: str = "par", task_type: str = "soft_label"):
-        self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_type = dataset_type
         self.task_type = task_type
@@ -69,16 +68,8 @@ class Par_Dataset(Dataset):
             labels = torch.tensor(annotations, dtype=torch.float)
             annotator_ids = []
         text = f"{question1} [SEP] {question2}"
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
+            'text': text,
             'labels': labels,
             'annotator_ids': torch.tensor([])
         }
@@ -100,26 +91,33 @@ class Par_Dataset(Dataset):
             soft_label = soft_label / soft_label.sum()
         return soft_label
 
-class RoBERTaForLeWiDi(nn.Module):
+class SBertForLeWiDi(nn.Module):
     def __init__(self, model_name: str, num_classes: int, task_type: str = "soft_label",
-                 num_annotators: Optional[int] = None):
-        super(RoBERTaForLeWiDi, self).__init__()
+                 num_annotators: Optional[int] = None, embedding_dim: int = 256):
+        super(SBertForLeWiDi, self).__init__()
         self.task_type = task_type
         self.num_classes = num_classes
         self.num_annotators = num_annotators
-        self.roberta = RobertaModel.from_pretrained(model_name)
+        self.sbert = SentenceTransformer(model_name)
         self.dropout = nn.Dropout(0.1)
+        emb_dim = self.sbert.get_sentence_embedding_dimension()
+        if emb_dim is None:
+            raise ValueError("SBert model did not return a valid embedding dimension.")
+        emb_dim = int(emb_dim)
+        self.embedding = nn.Linear(emb_dim, embedding_dim)
         if task_type == "soft_label":
-            self.classifier = nn.Linear(self.roberta.config.hidden_size, num_classes)
+            self.classifier = nn.Linear(embedding_dim, num_classes)
         else:
             if num_annotators is None:
                 raise ValueError("num_annotators must be provided for perspectivist task_type.")
-            self.classifier = nn.Linear(self.roberta.config.hidden_size, num_classes * num_annotators)
-    def forward(self, input_ids, attention_mask, labels=None, annotator_ids=None):
-        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.pooler_output
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+            self.classifier = nn.Linear(embedding_dim, num_classes * num_annotators)
+    def forward(self, texts, labels=None, annotator_ids=None):
+        # texts: list of strings
+        embeddings = self.sbert.encode(texts, convert_to_tensor=True)
+        x = self.dropout(embeddings)
+        x = self.embedding(x)
+        x = self.dropout(x)
+        logits = self.classifier(x)
         loss = None
         if labels is not None:
             if self.task_type == "soft_label":
@@ -127,7 +125,6 @@ class RoBERTaForLeWiDi(nn.Module):
                 loss = F.kl_div(log_probs, labels, reduction='batchmean')
             else:
                 logits = logits.view(-1, self.num_annotators, self.num_classes)
-                # Only shift valid labels (not -100)
                 labels_shifted = labels.clone()
                 mask = (labels != -100)
                 labels_shifted[mask] = labels[mask] + 5
@@ -144,9 +141,8 @@ class RoBERTaForLeWiDi(nn.Module):
         }
 
 class LeWiDiTrainer:
-    def __init__(self, model, tokenizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.model = model
-        self.tokenizer = tokenizer
         self.device = device
         self.model.to(device)
     def train(self, train_dataloader, val_dataloader, epochs=3, learning_rate=2e-5,
@@ -154,21 +150,18 @@ class LeWiDiTrainer:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         total_steps = len(train_dataloader) * epochs
         warmup_steps = int(total_steps * warmup_steps) if warmup_steps < 1 else warmup_steps
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
         self.model.train()
         best_val_loss = float('inf')
         for epoch in range(epochs):
             total_loss = 0
             for batch_idx, batch in enumerate(train_dataloader):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
                 annotator_ids = batch.get('annotator_ids', None)
                 if annotator_ids is not None:
                     annotator_ids = annotator_ids.to(self.device)
-                outputs = self.model(input_ids, attention_mask, labels, annotator_ids)
+                outputs = self.model(texts, labels, annotator_ids)
                 loss = outputs['loss']
                 optimizer.zero_grad()
                 loss.backward()
@@ -191,13 +184,12 @@ class LeWiDiTrainer:
         total_loss = 0
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
                 annotator_ids = batch.get('annotator_ids', None)
                 if annotator_ids is not None:
                     annotator_ids = annotator_ids.to(self.device)
-                outputs = self.model(input_ids, attention_mask, labels, annotator_ids)
+                outputs = self.model(texts, labels, annotator_ids)
                 total_loss += outputs['loss'].item()
         self.model.train()
         return total_loss / len(dataloader)
@@ -207,10 +199,9 @@ class LeWiDiTrainer:
         total_samples = 0
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                texts = batch['text']
                 labels = batch['labels'].to(self.device)
-                outputs = self.model(input_ids, attention_mask)
+                outputs = self.model(texts)
                 predictions = outputs['predictions']
                 manhattan_dist = torch.sum(torch.abs(predictions - labels), dim=1)
                 total_distance += manhattan_dist.sum().item()
@@ -220,18 +211,15 @@ class LeWiDiTrainer:
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
         torch.save(self.model.state_dict(), os.path.join(path, 'model.pt'))
-        self.tokenizer.save_pretrained(path)
     def load_model(self, path):
         self.model.load_state_dict(torch.load(os.path.join(path, 'model.pt')))
 
 def main():
-    MODEL_NAME = 'roberta-base'
+    MODEL_NAME = 'all-MiniLM-L6-v2'  # SBert model
     MAX_LENGTH = 512
     BATCH_SIZE = 16
     EPOCHS = 5  # Set to 5 epochs for real training
     LEARNING_RATE = 2e-5
-
-    tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
 
     config = {
         'num_classes': 11,  # Likert scale -5 to 5
@@ -246,25 +234,30 @@ def main():
         print(f"{'='*50}")
 
         train_dataset = Par_Dataset(
-            config['train_path'], tokenizer, MAX_LENGTH, 'par', task_type
+            config['train_path'], MAX_LENGTH, 'par', task_type
         )
         val_dataset = Par_Dataset(
-            config['val_path'], tokenizer, MAX_LENGTH, 'par', task_type
+            config['val_path'], MAX_LENGTH, 'par', task_type
         )
 
+        def collate_fn(batch):
+            texts = [item['text'] for item in batch]
+            labels = torch.stack([item['labels'] for item in batch])
+            return {'text': texts, 'labels': labels}
+
         train_dataloader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn
         )
         val_dataloader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
         )
 
         num_annotators = MAX_ANNOTATORS if task_type == 'perspectivist' else None
-        model = RoBERTaForLeWiDi(
+        model = SBertForLeWiDi(
             MODEL_NAME, config['num_classes'], task_type, num_annotators
         )
-        trainer = LeWiDiTrainer(model, tokenizer)
-        save_path = f'models/par_{task_type}_roberta'
+        trainer = LeWiDiTrainer(model)
+        save_path = f'models/par_{task_type}_sbert'
         trainer.train(
             train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
             save_path=save_path
@@ -276,24 +269,18 @@ def main():
 
 def predict_example():
     """Example prediction function for Paraphrase"""
-    tokenizer = RobertaTokenizer.from_pretrained('models/par_soft_label_roberta')
-    model = RoBERTaForLeWiDi('roberta-base', num_classes=11, task_type='soft_label')
-    trainer = LeWiDiTrainer(model, tokenizer)
-    trainer.load_model('models/par_soft_label_roberta')
+    tokenizer = SentenceTransformer('models/par_soft_label_sbert')
+    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=11, task_type='soft_label')
+    trainer = LeWiDiTrainer(model)
+    trainer.load_model('models/par_soft_label_sbert')
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     question1 = "How do I reset my password?"
     question2 = "What's the procedure for changing my login credentials?"
     text = f"{question1} [SEP] {question2}"
-    encoding = tokenizer(
-        text, truncation=True, padding='max_length', 
-        max_length=512, return_tensors='pt'
-    )
-    input_ids = encoding['input_ids'].to(device)
-    attention_mask = encoding['attention_mask'].to(device)
     model.eval()
     with torch.no_grad():
-        outputs = model(input_ids, attention_mask)
+        outputs = model([text])
         predictions = outputs['predictions']
     print(f"Soft label distribution: {predictions.cpu().numpy()}")
     predicted_class = torch.argmax(predictions, dim=-1).item() - 5  # -5 for Likert scale
@@ -322,10 +309,10 @@ def generate_submission_files():
     
     # Generate Task A (Soft Label) submission
     print("Generating Task A (Soft Label) submission...")
-    soft_model_path = 'models/par_soft_label_roberta'
-    tokenizer = RobertaTokenizer.from_pretrained(soft_model_path)
-    model = RoBERTaForLeWiDi('roberta-base', num_classes=num_bins, task_type='soft_label')
-    trainer = LeWiDiTrainer(model, tokenizer)
+    soft_model_path = 'models/par_soft_label_sbert'
+    tokenizer = SentenceTransformer(soft_model_path)
+    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='soft_label')
+    trainer = LeWiDiTrainer(model)
     trainer.load_model(soft_model_path)
     model.to(device)
     model.eval()
@@ -339,9 +326,9 @@ def generate_submission_files():
             text = f"{question1} [SEP] {question2}"
             
             # Tokenize and predict
-            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+            enc = tokenizer.encode(text, convert_to_tensor=True).to(device)
             with torch.no_grad():
-                outputs = model(enc['input_ids'], enc['attention_mask'])
+                outputs = model(enc)
                 probs = outputs['predictions'].squeeze(0).cpu()
             
             # Format output
@@ -366,10 +353,10 @@ def generate_submission_files():
     
     # Generate Task B (Perspectivist) submission
     print("Generating Task B (Perspectivist) submission...")
-    pe_model_path = 'models/par_perspectivist_roberta'
-    tokenizer_pe = RobertaTokenizer.from_pretrained(pe_model_path)
-    model_pe = RoBERTaForLeWiDi('roberta-base', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
-    trainer_pe = LeWiDiTrainer(model_pe, tokenizer_pe)
+    pe_model_path = 'models/par_perspectivist_sbert'
+    tokenizer_pe = SentenceTransformer(pe_model_path)
+    model_pe = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
+    trainer_pe = LeWiDiTrainer(model_pe)
     trainer_pe.load_model(pe_model_path)
     model_pe.to(device)
     model_pe.eval()
@@ -386,9 +373,9 @@ def generate_submission_files():
             ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
             
             # Tokenize and predict
-            enc = tokenizer_pe(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+            enc = tokenizer_pe.encode(text, convert_to_tensor=True).to(device)
             with torch.no_grad():
-                outputs = model_pe(enc['input_ids'], enc['attention_mask'])
+                outputs = model_pe(enc)
                 # outputs['predictions']: [1, MAX_ANNOTATORS, num_bins]
                 preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
             
