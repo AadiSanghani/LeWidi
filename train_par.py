@@ -1,563 +1,682 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from sentence_transformers import SentenceTransformer
-import os
-from typing import List, Tuple, Optional, Dict
-import warnings
-import csv
-import numpy as np
-from tqdm import tqdm
+import argparse
 import json
-warnings.filterwarnings('ignore')
+import os
+import sys
+from collections import Counter, defaultdict
 
-print("CUDA available:", torch.cuda.is_available())
-print("CUDA device count:", torch.cuda.device_count())
-print("Current device:", torch.cuda.current_device())
-print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.nn.utils.rnn import pad_sequence
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-MAX_ANNOTATORS = 5  # Maximum number of annotators for Paraphrase dataset
 
-class DemographicsEncoder:
-    """Encode demographic information into embeddings"""
-    def __init__(self, metadata_path: str, embedding_dim: int = 64):
-        self.embedding_dim = embedding_dim
-        self.metadata = self.load_metadata(metadata_path)
-        self.gender_encoder = nn.Embedding(3, embedding_dim // 4)  # Male, Female, Unknown
-        self.age_encoder = nn.Embedding(10, embedding_dim // 4)    # Age buckets
-        self.nationality_encoder = nn.Embedding(20, embedding_dim // 4)  # Nationality
-        self.education_encoder = nn.Embedding(10, embedding_dim // 4)    # Education level
-        
-        # Create mappings
-        self.gender_map = {"Male": 0, "Female": 1, "Unknown": 2}
-        self.nationality_map = self.create_nationality_map()
-        self.education_map = self.create_education_map()
-        
-    def load_metadata(self, metadata_path: str) -> Dict:
-        with open(metadata_path, 'r') as f:
-            content = f.read()
-            # Handle trailing commas in JSON by removing them
-            import re
-            content = re.sub(r',(\s*[}\]])', r'\1', content)
-            return json.loads(content)
+class ParDemogModel(torch.nn.Module):
+    """SentenceTransformer model with demographic embeddings for annotator-aware paraphrase detection."""
     
-    def create_nationality_map(self) -> Dict[str, int]:
-        nationalities = set()
-        for ann_data in self.metadata.values():
-            nationalities.add(ann_data.get("Nationality", "Unknown"))
-        return {nat: idx for idx, nat in enumerate(sorted(nationalities))}
-    
-    def create_education_map(self) -> Dict[str, int]:
-        educations = set()
-        for ann_data in self.metadata.values():
-            educations.add(ann_data.get("Education", "Unknown"))
-        return {edu: idx for idx, edu in enumerate(sorted(educations))}
-    
-    def get_age_bucket(self, age_str: str) -> int:
-        try:
-            age = int(age_str)
-            if age < 20: return 0
-            elif age < 25: return 1
-            elif age < 30: return 2
-            elif age < 35: return 3
-            elif age < 40: return 4
-            elif age < 45: return 5
-            elif age < 50: return 6
-            elif age < 55: return 7
-            elif age < 60: return 8
-            else: return 9
-        except:
-            return 0
-    
-    def encode_annotator(self, annotator_id: str) -> torch.Tensor:
-        if annotator_id not in self.metadata:
-            # Return zero embedding for unknown annotators
-            return torch.zeros(self.embedding_dim)
-        
-        ann_data = self.metadata[annotator_id]
-        
-        gender_idx = self.gender_map.get(ann_data.get("Gender", "Unknown"), 2)
-        age_idx = self.get_age_bucket(ann_data.get("Age", "25"))
-        nationality_idx = self.nationality_map.get(ann_data.get("Nationality", "Unknown"), 0)
-        education_idx = self.education_map.get(ann_data.get("Education", "Unknown"), 0)
-        
-        gender_emb = self.gender_encoder(torch.tensor(gender_idx))
-        age_emb = self.age_encoder(torch.tensor(age_idx))
-        nationality_emb = self.nationality_encoder(torch.tensor(nationality_idx))
-        education_emb = self.education_encoder(torch.tensor(education_idx))
-        
-        return torch.cat([gender_emb, age_emb, nationality_emb, education_emb])
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, dropout_rate: float = 0.3, num_classes: int = 11):
+        super().__init__()
+        from sentence_transformers import SentenceTransformer
 
-class Par_Dataset(Dataset):
-    """Dataset class for Par dataset with demographics support"""
-    def __init__(self, data_path: str, max_length: int = 512, 
-                 dataset_type: str = "par", task_type: str = "soft_label",
-                 metadata_path: Optional[str] = None):
-        self.max_length = max_length
-        self.dataset_type = dataset_type
-        self.task_type = task_type
-        self.data = self.load_data(data_path)
-        self.demographics_encoder = None
-        if metadata_path and os.path.exists(metadata_path):
-            self.demographics_encoder = DemographicsEncoder(metadata_path)
-    
-    def load_data(self, data_path: str):
-        import json
-        if data_path.endswith('.json'):
-            with open(data_path, 'r') as f:
-                data = json.load(f)
-        else:
-            raise ValueError("Unsupported file format. Use .json.")
-        return data
-    
-    def __len__(self):
-        if isinstance(self.data, list):
-            return len(self.data)
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        if isinstance(self.data, list):
-            item = self.data[idx]
-        else:
-            item = list(self.data.values())[idx]
-        if self.dataset_type == "par":
-            return self.process_par_item(item)
-        elif self.dataset_type == "varierrnli":
-            return self.process_varierrnli_item(item)
-        else:
-            raise ValueError(f"Unknown dataset type: {self.dataset_type}")
-    
-    def process_par_item(self, item):
-        question1 = item['text']['Question1']
-        question2 = item['text']['Question2']
-        
-        if self.task_type == "soft_label":
-            soft_label_dict = item['soft_label']
-            soft_label = [float(soft_label_dict[str(i)]) for i in range(-5, 6)]
-            soft_label = torch.tensor(soft_label, dtype=torch.float)
-            labels = soft_label
-            annotator_ids = []
-            demographic_embeddings = []
-        else:
-            annotator_list = [a.strip() for a in item['annotators'].split(',')]
-            annotations_dict = item['annotations']
-            
-            # Build annotation list, pad to MAX_ANNOTATORS with -100
-            annotations = [float(annotations_dict[ann]) for ann in annotator_list]
-            while len(annotations) < MAX_ANNOTATORS:
-                annotations.append(-100)
-            labels = torch.tensor(annotations, dtype=torch.float)
-            
-            # Create demographic embeddings for each annotator
-            demographic_embeddings = []
-            for ann in annotator_list:
-                if self.demographics_encoder:
-                    dem_emb = self.demographics_encoder.encode_annotator(ann)
-                else:
-                    dem_emb = torch.zeros(64)  # Default embedding dimension
-                demographic_embeddings.append(dem_emb)
-            
-            # Pad demographic embeddings
-            while len(demographic_embeddings) < MAX_ANNOTATORS:
-                demographic_embeddings.append(torch.zeros(64))
-            
-            demographic_embeddings = torch.stack(demographic_embeddings)
-            annotator_ids = torch.tensor([hash(ann) % 1000 for ann in annotator_list[:MAX_ANNOTATORS]], dtype=torch.long)
-            while len(annotator_ids) < MAX_ANNOTATORS:
-                annotator_ids = torch.cat([annotator_ids, torch.tensor([-1])])
-        
-        text = f"{question1} [SEP] {question2}"
-        return {
-            'text': text,
-            'labels': labels,
-            'annotator_ids': annotator_ids if self.task_type == "perspectivist" else torch.tensor([]),
-            'demographic_embeddings': demographic_embeddings if self.task_type == "perspectivist" else torch.tensor([])
-        }
-    
-    def process_varierrnli_item(self, item):
-        # Not used in this script
-        return {}
-    
-    def create_soft_label(self, annotations: List, scale_range: Tuple[int, int], categorical: bool = False):
-        # Not used anymore, but kept for compatibility
-        num_classes = scale_range[1] - scale_range[0]
-        soft_label = torch.zeros(num_classes)
-        for ann in annotations:
-            try:
-                ann = int(ann)
-            except (ValueError, TypeError):
-                continue
-            if scale_range[0] <= ann < scale_range[1]:
-                soft_label[ann - scale_range[0]] += 1
-        if soft_label.sum() > 0:
-            soft_label = soft_label / soft_label.sum()
-        return soft_label
-
-class SBertForLeWiDi(nn.Module):
-    def __init__(self, model_name: str, num_classes: int, task_type: str = "soft_label",
-                 num_annotators: Optional[int] = None, embedding_dim: int = 256,
-                 use_demographics: bool = False):
-        super(SBertForLeWiDi, self).__init__()
-        self.task_type = task_type
+        self.text_model = SentenceTransformer(base_name)
         self.num_classes = num_classes
-        self.num_annotators = num_annotators
-        self.use_demographics = use_demographics
         
-        self.sbert = SentenceTransformer(model_name)
-        self.dropout = nn.Dropout(0.1)
-        
-        emb_dim = self.sbert.get_sentence_embedding_dimension()
+        # Create embeddings dynamically based on vocab_sizes
+        self.demographic_embeddings = torch.nn.ModuleDict()
+        for field, vocab_size in vocab_sizes.items():
+            self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
+
+        # Get embedding dimension from SBert
+        emb_dim = self.text_model.get_sentence_embedding_dimension()
         if emb_dim is None:
             raise ValueError("SBert model did not return a valid embedding dimension.")
         emb_dim = int(emb_dim)
         
-        # Enhanced embedding layer that can incorporate demographics
-        if use_demographics and task_type == "perspectivist":
-            self.embedding = nn.Linear(emb_dim + 64, embedding_dim)  # +64 for demographics
-        else:
-            self.embedding = nn.Linear(emb_dim, embedding_dim)
+        num_demog_fields = len(vocab_sizes)
+        total_dim = emb_dim + num_demog_fields * dem_dim
         
-        if task_type == "soft_label":
-            self.classifier = nn.Linear(embedding_dim, num_classes)
-        else:
-            if num_annotators is None:
-                raise ValueError("num_annotators must be provided for perspectivist task_type.")
-            self.classifier = nn.Linear(embedding_dim, num_classes * num_annotators)
-    
-    def forward(self, texts, labels=None, annotator_ids=None, demographic_embeddings=None):
-        # texts: list of strings
-        embeddings = self.sbert.encode(texts, convert_to_tensor=True)
-        
-        if self.use_demographics and self.task_type == "perspectivist" and demographic_embeddings is not None:
-            # For perspectivist with demographics, we need to handle each sample-annotator pair
-            batch_size = embeddings.shape[0]
-            num_annotators = self.num_annotators or MAX_ANNOTATORS
-            
-            # Expand text embeddings to match annotator dimension
-            # embeddings: [batch_size, emb_dim] -> [batch_size * num_annotators, emb_dim]
-            expanded_embeddings = embeddings.unsqueeze(1).expand(-1, num_annotators, -1)
-            expanded_embeddings = expanded_embeddings.reshape(-1, embeddings.shape[-1])
-            
-            # Reshape demographic embeddings: [batch_size, num_annotators, dem_dim] -> [batch_size * num_annotators, dem_dim]
-            demographic_flat = demographic_embeddings.reshape(-1, demographic_embeddings.shape[-1])
-            
-            # Concatenate text and demographic embeddings
-            embeddings = torch.cat([expanded_embeddings, demographic_flat], dim=1)
-        else:
-            # For soft_label or no demographics, use original embeddings
-            pass
-        
-        x = self.dropout(embeddings)
-        x = self.embedding(x)
-        x = self.dropout(x)
-        logits = self.classifier(x)
-        
-        loss = None
-        if labels is not None:
-            if self.task_type == "soft_label":
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = F.kl_div(log_probs, labels, reduction='batchmean')
-            else:
-                # For perspectivist, handle the expanded logits properly
-                if self.use_demographics and demographic_embeddings is not None:
-                    # Logits are already [batch_size * num_annotators, num_classes]
-                    # Labels are [batch_size, num_annotators], need to flatten
-                    labels_shifted = labels.clone()
-                    mask = (labels != -100)
-                    labels_shifted[mask] = labels[mask] + 5
-                    labels_shifted = labels_shifted.long()
-                    loss = F.cross_entropy(
-                        logits,  # Already [batch_size * num_annotators, num_classes]
-                        labels_shifted.view(-1),  # Flatten to [batch_size * num_annotators]
-                        ignore_index=-100
-                    )
-                    # Reshape logits back for output
-                    logits = logits.view(-1, self.num_annotators, self.num_classes)
-                else:
-                    # Original perspectivist logic without demographics
-                    logits = logits.view(-1, self.num_annotators, self.num_classes)
-                    labels_shifted = labels.clone()
-                    mask = (labels != -100)
-                    labels_shifted[mask] = labels[mask] + 5
-                    labels_shifted = labels_shifted.long()
-                    loss = F.cross_entropy(
-                        logits.view(-1, self.num_classes),
-                        labels_shifted.view(-1),
-                        ignore_index=-100
-                    )
-        
-        return {
-            'loss': loss,
-            'logits': logits,
-            'predictions': F.softmax(logits, dim=-1) if self.task_type == "soft_label" else logits
-        }
+        self.norm = torch.nn.LayerNorm(total_dim)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.classifier = torch.nn.Linear(total_dim, num_classes)
 
-class LeWiDiTrainer:
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.model = model
-        self.device = device
-        self.model.to(device)
-    def train(self, train_dataloader, val_dataloader, epochs=3, learning_rate=2e-5,
-              warmup_steps=0.1, save_path=None):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
-        total_steps = len(train_dataloader) * epochs
-        warmup_steps = int(total_steps * warmup_steps) if warmup_steps < 1 else warmup_steps
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
-        self.model.train()
-        best_val_loss = float('inf')
-        for epoch in range(epochs):
-            total_loss = 0
-            for batch_idx, batch in enumerate(train_dataloader):
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                annotator_ids = batch.get('annotator_ids', None)
-                demographic_embeddings = batch.get('demographic_embeddings', None)
-                if annotator_ids is not None:
-                    annotator_ids = annotator_ids.to(self.device)
-                if demographic_embeddings is not None:
-                    demographic_embeddings = demographic_embeddings.to(self.device)
-                outputs = self.model(texts, labels, annotator_ids, demographic_embeddings)
-                loss = outputs['loss']
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                total_loss += loss.item()
-                if batch_idx % 100 == 0:
-                    print(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}/{len(train_dataloader)}, '
-                          f'Loss: {loss.item():.4f}')
-            val_loss = self.evaluate(val_dataloader)
-            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {total_loss/len(train_dataloader):.4f}, '
-                  f'Val Loss: {val_loss:.4f}')
-            if save_path and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_model(save_path)
-                print(f'Model saved to {save_path}')
-    def evaluate(self, dataloader):
-        self.model.eval()
-        total_loss = 0
-        with torch.no_grad():
-            for batch in dataloader:
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                annotator_ids = batch.get('annotator_ids', None)
-                demographic_embeddings = batch.get('demographic_embeddings', None)
-                if annotator_ids is not None:
-                    annotator_ids = annotator_ids.to(self.device)
-                if demographic_embeddings is not None:
-                    demographic_embeddings = demographic_embeddings.to(self.device)
-                outputs = self.model(texts, labels, annotator_ids, demographic_embeddings)
-                total_loss += outputs['loss'].item()
-        self.model.train()
-        return total_loss / len(dataloader)
-    def manhattan_distance_evaluation(self, dataloader):
-        self.model.eval()
-        total_distance = 0
-        total_samples = 0
-        with torch.no_grad():
-            for batch in dataloader:
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                outputs = self.model(texts)
-                predictions = outputs['predictions']
-                manhattan_dist = torch.sum(torch.abs(predictions - labels), dim=1)
-                total_distance += manhattan_dist.sum().item()
-                total_samples += len(predictions)
-        self.model.train()
-        return total_distance / total_samples
-    def save_model(self, path):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.model.state_dict(), os.path.join(path, 'model.pt'))
-    def load_model(self, path):
-        self.model.load_state_dict(torch.load(os.path.join(path, 'model.pt')))
+    def forward(self, *, texts, **demographic_inputs):
+        # Get text embeddings
+        text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+        
+        # Get demographic embeddings dynamically
+        demographic_vectors = []
+        for field, emb_layer in self.demographic_embeddings.items():
+            field_key = f"{field}_ids"
+            if field_key in demographic_inputs:
+                demographic_vec = emb_layer(demographic_inputs[field_key])
+                demographic_vectors.append(demographic_vec)
 
-def main():
-    MODEL_NAME = 'all-MiniLM-L6-v2'  # SBert model
-    MAX_LENGTH = 512
-    BATCH_SIZE = 16
-    EPOCHS = 5  # Set to 5 epochs for real training
-    LEARNING_RATE = 2e-5
+        # Concatenate all vectors
+        if demographic_vectors:
+            concat = torch.cat([text_embeddings] + demographic_vectors, dim=-1)
+        else:
+            concat = text_embeddings
+            
+        concat = self.norm(concat)
+        concat = self.dropout(concat)
+        logits = self.classifier(concat)
+        return logits
 
-    config = {
-        'num_classes': 11,  # Likert scale -5 to 5
-        'train_path': 'dataset/Paraphrase/Paraphrase_train.json',
-        'val_path': 'dataset/Paraphrase/Paraphrase_dev.json',
-        'test_path': 'models/Paraphrase_test.json'
+
+class ParDataset(Dataset):
+    """Dataset with demographic embeddings for paraphrase detection."""
+
+    PAD_IDX = 0  # padding
+    UNK_IDX = 1  # unknown / missing
+
+    FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender",
+        "ethnicity": "Ethnicity simplified",
+        "country_birth": "Country of birth",
+        "country_residence": "Country of residence",
+        "nationality": "Nationality",
+        "student": "Student status",
+        "employment": "Employment status",
     }
 
-    for task_type in ['soft_label', 'perspectivist']:
-        print(f"\n{'='*50}")
-        print(f"Training on PARAPHRASE dataset - Task Type: {task_type}")
-        print(f"{'='*50}")
+    # Reduced field set for better performance
+    REDUCED_FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender", 
+        "ethnicity": "Ethnicity simplified",
+        "country_residence": "Country of residence",
+        "employment": "Employment status",
+    }
 
-        train_dataset = Par_Dataset(
-            config['train_path'], MAX_LENGTH, 'par', task_type,
-            metadata_path='dataset/Paraphrase/Paraphrase_annotators_meta.json'
-        )
-        val_dataset = Par_Dataset(
-            config['val_path'], MAX_LENGTH, 'par', task_type,
-            metadata_path='dataset/Paraphrase/Paraphrase_annotators_meta.json'
-        )
-
-        def collate_fn(batch):
-            texts = [item['text'] for item in batch]
-            labels = torch.stack([item['labels'] for item in batch])
-            if task_type == "perspectivist":
-                annotator_ids = torch.stack([item['annotator_ids'] for item in batch])
-                demographic_embeddings = torch.stack([item['demographic_embeddings'] for item in batch])
-                return {'text': texts, 'labels': labels, 'annotator_ids': annotator_ids, 'demographic_embeddings': demographic_embeddings}
+    @staticmethod
+    def get_age_bin(age):
+        """Convert age to age bin."""
+        if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
+            return "<UNK>"
+        try:
+            age = float(age)
+            if age < 25:
+                return "18-24"
+            elif age < 35:
+                return "25-34"
+            elif age < 45:
+                return "35-44"
+            elif age < 55:
+                return "45-54"
             else:
-                return {'text': texts, 'labels': labels}
+                return "55+"
+        except (ValueError, TypeError):
+            return "<UNK>"
 
-        train_dataloader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn
-        )
-        val_dataloader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
-        )
+    def __init__(
+        self,
+        path: str,
+        annot_meta_path: str,
+        max_length: int = 512,
+    ):
+        self.max_length = max_length
+        
+        # Always use reduced demographics for better performance
+        self.active_field_keys = self.REDUCED_FIELD_KEYS
 
-        num_annotators = MAX_ANNOTATORS if task_type == 'perspectivist' else None
-        model = SBertForLeWiDi(
-            MODEL_NAME, config['num_classes'], task_type, num_annotators, use_demographics=task_type == 'perspectivist'
-        )
-        trainer = LeWiDiTrainer(model)
-        save_path = f'models/par_{task_type}_sbert'
-        trainer.train(
-            train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
-            save_path=save_path
-        )
-        if task_type == 'soft_label':
-            manhattan_score = trainer.manhattan_distance_evaluation(val_dataloader)
-            print(f"Manhattan Distance Score: {manhattan_score:.4f}")
-        print(f"Model saved to {save_path}")
+        self.texts = []
+        self.labels = []
+        self.dists = []
+        
+        # Initialize storage for active fields only - now storing single values per example
+        self.demographic_ids = {field: [] for field in self.active_field_keys}
 
-def predict_example():
-    """Example prediction function for Paraphrase"""
-    tokenizer = SentenceTransformer('models/par_soft_label_sbert')
-    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=11, task_type='soft_label')
-    trainer = LeWiDiTrainer(model)
-    trainer.load_model('models/par_soft_label_sbert')
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    question1 = "How do I reset my password?"
-    question2 = "What's the procedure for changing my login credentials?"
-    text = f"{question1} [SEP] {question2}"
+        with open(annot_meta_path, "r", encoding="utf-8") as f:
+            annot_meta = json.load(f)
+
+        self.annot_meta = annot_meta
+
+        self.vocab = {
+            field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
+            for field in self.active_field_keys
+        }
+
+        # Build vocabulary from all annotators
+        for ann_data in annot_meta.values():
+            for field, json_key in self.active_field_keys.items():
+                if field == "age":
+                    # Special handling for age - convert to age bin
+                    age_bin = self.get_age_bin(ann_data.get(json_key))
+                    if age_bin not in self.vocab[field]:
+                        self.vocab[field][age_bin] = len(self.vocab[field])
+                else:
+                    val = str(ann_data.get(json_key, "")).strip()
+                    if val == "":
+                        val = "<UNK>"
+                    if val not in self.vocab[field]:
+                        self.vocab[field][val] = len(self.vocab[field])
+
+        self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
+        
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for ex in data.values():
+            question1 = ex["text"].get("Question1", "")
+            question2 = ex["text"].get("Question2", "")
+            full_text = f"{question1} [SEP] {question2}".strip()
+
+            soft_label = ex.get("soft_label", {})
+            if not soft_label or soft_label == "":
+                continue
+            
+            # Convert to 11-class distribution (-5 to 5)
+            soft_label_list = [float(soft_label.get(str(i), 0.0)) for i in range(-5, 6)]
+            dist = np.array(soft_label_list, dtype=np.float32)
+            if dist.sum() == 0:
+                continue
+            dist /= dist.sum()
+            hard_label = int(np.argmax(dist))
+
+            ann_str = ex.get("annotators", "")
+            ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
+            if not ann_list:
+                ann_list = []
+
+            # Create separate examples for each annotator
+            for ann_tag in ann_list:
+                ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
+                meta = annot_meta.get(ann_num, {})
+                
+                # Get demographic info for this specific annotator
+                annotator_demog_ids = {}
+                for field, json_key in self.active_field_keys.items():
+                    if field == "age":
+                        age_bin = self.get_age_bin(meta.get(json_key))
+                        idx = self.vocab[field].get(age_bin, self.UNK_IDX)
+                    else:
+                        val = str(meta.get(json_key, "")).strip()
+                        if val == "":
+                            val = "<UNK>"
+                        idx = self.vocab[field].get(val, self.UNK_IDX)
+                    annotator_demog_ids[field] = idx
+
+                # Add this annotator's example
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store single demographic IDs for this annotator
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(annotator_demog_ids[field])
+
+            # If no annotators, create one example with UNK demographic info
+            if not ann_list:
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store UNK demographic IDs
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(self.UNK_IDX)
+
+        print(f"Dataset created with {len(self.texts)} examples (expanded from {len(data)} original examples)")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        result = {
+            "texts": self.texts[idx],
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+        }
+        
+        # Add demographic fields dynamically
+        for field in self.active_field_keys:
+            result[f"{field}_ids"] = torch.tensor(self.demographic_ids[field][idx], dtype=torch.long)
+        
+        return result
+
+
+def collate_fn(batch):
+    """Handles single demographic values for paraphrase dataset."""
+
+    texts = [b["texts"] for b in batch]
+    labels = torch.stack([b["labels"] for b in batch])
+    dists = torch.stack([b["dist"] for b in batch])
+
+    result = {
+        "texts": texts,
+        "labels": labels,
+        "dist": dists,
+    }
+    
+    # Dynamically handle demographic fields - now single values, not lists
+    demographic_keys = [k for k in batch[0].keys() 
+                        if k.endswith("_ids") and k not in ["input_ids"]]
+    for key in demographic_keys:
+        tensors = [b[key] for b in batch]
+        # Stack single values instead of padding lists
+        stacked = torch.stack(tensors)
+        result[key] = stacked
+
+    return result
+
+
+def build_sampler(labels):
+    """Create WeightedRandomSampler to balance classes."""
+    counts = Counter(labels)
+    total = float(sum(counts.values()))
+    num_classes = len(counts)
+    class_weights = {c: total / (num_classes * cnt) for c, cnt in counts.items()}
+    weights = [class_weights[l] for l in labels]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+
+def evaluate(model, dataloader, device):
+    """Return mean Manhattan (L1) distance between predicted and true distributions."""
     model.eval()
+    total_dist = 0.0
+    n_examples = 0
+    all_predictions = []
+    all_targets = []
+    
     with torch.no_grad():
-        outputs = model([text])
-        predictions = outputs['predictions']
-    print(f"Soft label distribution: {predictions.cpu().numpy()}")
-    predicted_class = torch.argmax(predictions, dim=-1).item() - 5  # -5 for Likert scale
-    print(f"Most likely rating: {predicted_class}")
+        for batch in dataloader:
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+            # Prepare demographic inputs dynamically (exclude texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
+            logits = model(
+                texts=batch["texts"],
+                **demographic_inputs
+            )
+            p_hat = torch.softmax(logits, dim=-1)
+            dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
+            total_dist += dist.sum().item()
+            n_examples += dist.numel()
+            
+            # Store predictions and targets for analysis
+            all_predictions.extend(p_hat.cpu().numpy())
+            all_targets.extend(batch["dist"].cpu().numpy())
+    
+    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets
 
-def generate_submission_files():
-    """Generate Codabench submission files for Paraphrase dataset using trained models."""
-    import json
-    import argparse
-    from pathlib import Path
+
+def analyze_predictions(predictions, targets, epoch, output_dir):
+    """Analyze prediction distributions and save plots."""
+    predictions = np.array(predictions)
+    targets = np.array(targets)
     
-    # Configuration for Paraphrase dataset
-    test_file = 'dataset/Paraphrase/Paraphrase_dev.json'  # Use dev for testing, change to test when available
-    max_length = 512
-    num_bins = 11  # Likert scale -5 to 5
+    # Calculate prediction bias (for class 5, which is the highest rating)
+    pred_bias = np.mean(predictions[:, 10] - targets[:, 10])  # bias toward class 5
+    pred_std = np.std(predictions[:, 10])
+    target_std = np.std(targets[:, 10])
     
+    # Create analysis plots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Plot 1: Prediction vs Target scatter (for highest class)
+    axes[0, 0].scatter(targets[:, 10], predictions[:, 10], alpha=0.5, s=1)
+    axes[0, 0].plot([0, 1], [0, 1], 'r--', alpha=0.8)
+    axes[0, 0].set_xlabel('True P(rating=5)')
+    axes[0, 0].set_ylabel('Predicted P(rating=5)')
+    axes[0, 0].set_title(f'Epoch {epoch}: Prediction vs Target')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot 2: Prediction distribution
+    axes[0, 1].hist(predictions[:, 10], bins=50, alpha=0.7, label='Predictions')
+    axes[0, 1].hist(targets[:, 10], bins=50, alpha=0.7, label='Targets')
+    axes[0, 1].set_xlabel('P(rating=5)')
+    axes[0, 1].set_ylabel('Count')
+    axes[0, 1].set_title(f'Epoch {epoch}: Distribution Comparison')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Plot 3: Error distribution
+    errors = predictions[:, 10] - targets[:, 10]
+    axes[1, 0].hist(errors, bins=50, alpha=0.7)
+    axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.8)
+    axes[1, 0].set_xlabel('Prediction Error')
+    axes[1, 0].set_ylabel('Count')
+    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (bias={pred_bias:.3f})')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Plot 4: Error vs Target
+    axes[1, 1].scatter(targets[:, 10], errors, alpha=0.5, s=1)
+    axes[1, 1].axhline(0, color='red', linestyle='--', alpha=0.8)
+    axes[1, 1].set_xlabel('True P(rating=5)')
+    axes[1, 1].set_ylabel('Prediction Error')
+    axes[1, 1].set_title(f'Epoch {epoch}: Error vs Target')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'epoch_{epoch}_analysis.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return {
+        'pred_bias': pred_bias,
+        'pred_std': pred_std,
+        'target_std': target_std,
+        'mean_error': np.mean(np.abs(errors))
+    }
+
+
+def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Plot and save training metrics and curves."""
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Training loss vs validation distance
+    ax_comb = axes[0, 0]
+    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+    if val_dist_history:
+        ax_comb_twin = ax_comb.twinx()
+        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
+        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
+    ax_comb.set_title('Training Loss vs Validation Distance')
+    ax_comb.set_xlabel('Epoch')
+    ax_comb.set_ylabel('Training Loss', color='blue')
+    ax_comb.tick_params(axis='y', labelcolor='blue')
+    ax_comb.grid(True, alpha=0.3)
+
+    # Validation distance with best epoch marker
+    if val_dist_history:
+        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
+        axes[0, 1].set_title('Validation Manhattan Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
+        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Analysis metrics
+    if analysis_history:
+        biases = [a['pred_bias'] for a in analysis_history]
+        errors = [a['mean_error'] for a in analysis_history]
+        axes[1, 1].plot(epochs_range, biases, marker='o', label='Prediction Bias', color='purple')
+        axes[1, 1].plot(epochs_range, errors, marker='s', label='Mean Abs Error', color='brown')
+        axes[1, 1].set_title('Prediction Analysis')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Metric Value')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Separate combined plot for quick reference
+    if val_dist_history:
+        fig2, ax1 = plt.subplots(figsize=(8, 5))
+        ax1.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Train Loss', color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
+        ax2 = ax1.twinx()
+        ax2.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax2.set_ylabel('Validation Distance', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+        ax1.set_title('Train Loss vs Val Distance')
+        ax1.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(os.path.join(output_dir, 'loss_vs_val.png'), dpi=150, bbox_inches='tight')
+        plt.close(fig2)
+
+    # Save metrics to JSON
+    metrics = {
+        'train_loss': [float(x) for x in train_loss_history],
+        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
+        'learning_rates': [float(x) for x in lr_history],
+        'analysis': [
+            {
+                'pred_bias': float(a['pred_bias']),
+                'pred_std': float(a['pred_std']),
+                'target_std': float(a['target_std']),
+                'mean_error': float(a['mean_error'])
+            } for a in analysis_history
+        ],
+        'best_epoch': int(best_epoch) if val_dist_history else None,
+        'best_metric': float(best_metric) if val_dist_history else None
+    }
+    
+    with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
+def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load test data
-    with open(test_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    
-    # Convert to list if it's a dict
-    if isinstance(data, dict):
-        data = list(data.values())
-    
-    # Generate Task A (Soft Label) submission
-    print("Generating Task A (Soft Label) submission...")
-    soft_model_path = 'models/par_soft_label_sbert'
-    model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='soft_label')
-    trainer = LeWiDiTrainer(model)
-    trainer.load_model(soft_model_path)
+    print(f"Using device: {device}")
+
+    train_ds = ParDataset(args.train_file, args.annot_meta, args.max_length)
+    val_ds = ParDataset(args.val_file, args.annot_meta, args.max_length) if args.val_file else None
+
+    print(f"Training samples: {len(train_ds)}")
+    if val_ds:
+        print(f"Validation samples: {len(val_ds)}")
+    print(f"Using reduced demographic fields: {list(train_ds.active_field_keys.keys())}")
+    print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
+
+    sampler = build_sampler(train_ds.labels) if args.balance else None
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        collate_fn=collate_fn,
+    )
+    val_loader = (
+        DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
+    )
+
+    model = ParDemogModel(
+        base_name=args.model_name,
+        vocab_sizes=train_ds.vocab_sizes,
+        dem_dim=args.dem_dim,
+        dropout_rate=args.dropout_rate,
+        num_classes=args.num_classes,
+    )
     model.to(device)
-    model.eval()
-    
-    output_file = 'Paraphrase_test_soft.tsv'
-    with open(output_file, "w", encoding="utf-8") as out_f:
-        for idx, ex in tqdm(enumerate(data), desc="Task A predictions"):
-            # Build input text
-            question1 = ex['text']['Question1']
-            question2 = ex['text']['Question2']
-            text = f"{question1} [SEP] {question2}"
-            with torch.no_grad():
-                outputs = model([text])
-                probs = outputs['predictions'].squeeze(0).cpu()
-            # Format output
-            out_probs = probs.tolist()
-            # Ensure we output exactly num_bins probabilities
-            if len(out_probs) < num_bins:
-                pad = [0.0] * (num_bins - len(out_probs))
-                out_probs = pad + out_probs
-            # Round to 10 decimals and fix any rounding drift
-            out_probs = [round(p, 10) for p in out_probs]
-            drift = 1.0 - sum(out_probs)
-            if abs(drift) > 1e-10:
-                idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
-                out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
-            prob_str = ",".join(f"{p:.10f}" for p in out_probs)
-            out_f.write(f"{idx}\t[{prob_str}]\n")
-    print(f"Saved Task A submission file to {output_file}")
-    
-    # Generate Task B (Perspectivist) submission
-    print("Generating Task B (Perspectivist) submission...")
-    pe_model_path = 'models/par_perspectivist_sbert'
-    model_pe = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='perspectivist', 
-                              num_annotators=MAX_ANNOTATORS, use_demographics=True)
-    trainer_pe = LeWiDiTrainer(model_pe)
-    trainer_pe.load_model(pe_model_path)
-    model_pe.to(device)
-    model_pe.eval()
-    
-    # Load demographics encoder for inference
-    demographics_encoder = DemographicsEncoder('dataset/Paraphrase/Paraphrase_annotators_meta.json')
-    
-    output_file_pe = 'Paraphrase_test_pe.tsv'
-    with open(output_file_pe, "w", encoding="utf-8") as out_f:
-        for idx, ex in tqdm(enumerate(data), desc="Task B predictions"):
-            question1 = ex['text']['Question1']
-            question2 = ex['text']['Question2']
-            text = f"{question1} [SEP] {question2}"
-            ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
+
+    no_decay = ["bias", "LayerNorm.weight"]
+    grouped_params = [
+        {"params": [p for n,p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         "weight_decay": args.weight_decay},
+        {"params": [p for n,p in model.named_parameters() if any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    optimiser = AdamW(grouped_params, lr=args.lr)
+
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+                   optimiser,
+                   num_warmup_steps=warmup_steps,
+                   num_training_steps=total_steps)
+
+    best_metric = float("inf")
+    epochs_no_improve = 0
+    best_epoch = 0
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    train_loss_history = []
+    val_dist_history = []
+    lr_history = []
+    analysis_history = []
+
+    print(f"Total training steps: {total_steps}")
+    print(f"Initial learning rate: {args.lr}")
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        epoch_l1_loss = 0.0
+        epoch_kl_loss = 0.0
+        step_count = 0
+        
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # Create demographic embeddings for each annotator
-            demographic_embeddings = []
-            for ann in ann_list:
-                dem_emb = demographics_encoder.encode_annotator(ann.strip())
-                demographic_embeddings.append(dem_emb)
+            # Prepare demographic inputs dynamically (exclude texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
             
-            # Pad to MAX_ANNOTATORS
-            while len(demographic_embeddings) < MAX_ANNOTATORS:
-                demographic_embeddings.append(torch.zeros(64))
+            logits = model(
+                texts=batch["texts"],
+                **demographic_inputs
+            )
+
+            p_hat = torch.softmax(logits, dim=-1)
+            l1_loss = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1).mean()
+            kl_loss = F.kl_div(torch.log(p_hat + 1e-12), batch["dist"], reduction="batchmean")
+            loss = (1 - args.lambda_kl) * l1_loss + args.lambda_kl * kl_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+            scheduler.step()
+            optimiser.zero_grad()
+
+            epoch_loss += loss.item()
+            epoch_l1_loss += l1_loss.item()
+            epoch_kl_loss += kl_loss.item()
+            step_count += 1
             
-            demographic_embeddings = torch.stack(demographic_embeddings).unsqueeze(0).to(device)
+            if step % 100 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                avg_loss = epoch_loss / step_count
+                avg_l1 = epoch_l1_loss / step_count
+                avg_kl = epoch_kl_loss / step_count
+                tqdm.write(f"Epoch {epoch} step {step}: total_loss={avg_loss:.4f}, l1_loss={avg_l1:.4f}, kl_loss={avg_kl:.4f}, lr={current_lr:.2e}")
+
+        if val_loader:
+            val_dist, predictions, targets = evaluate(model, val_loader, device)
+            print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
             
-            with torch.no_grad():
-                outputs = model_pe([text], demographic_embeddings=demographic_embeddings)
-                preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
+            analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
+            analysis_history.append(analysis)
             
-            annotator_preds = []
-            for i in range(len(ann_list)):
-                rating_idx = torch.argmax(preds[i]).item()
-                rating = rating_idx - 5  # Convert to Likert scale -5 to 5
-                annotator_preds.append(str(rating))
-            preds_str = ", ".join(annotator_preds)
-            out_f.write(f"{idx}\t[{preds_str}]\n")
-    print(f"Saved Task B submission file to {output_file_pe}")
-    print("To submit: zip -j res.zip", output_file, output_file_pe)
+            print(f"Epoch {epoch} Analysis:")
+            print(f"  Prediction bias: {analysis['pred_bias']:.4f}")
+            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
+            print(f"  Prediction std: {analysis['pred_std']:.4f}")
+            print(f"  Target std: {analysis['target_std']:.4f}")
+            
+            if val_dist < best_metric:
+                best_metric = val_dist
+                best_epoch = epoch
+                epochs_no_improve = 0
+                save_path = os.path.join(args.output_dir, "best_model")
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
+                print(f"New best model saved to {save_path}")
+            else:
+                epochs_no_improve += 1
+
+        train_loss_history.append(epoch_loss / step_count)
+        if val_loader:
+            val_dist_history.append(val_dist)
+        lr_history.append(scheduler.get_last_lr()[0])
+
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    final_path = os.path.join(args.output_dir, "last_model")
+    os.makedirs(final_path, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
+
+    visualize_demog_embeddings(model, train_ds, args.output_dir)
+    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+
+    print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
+    if val_dist_history:
+        print(f"Best epoch: {best_epoch}")
+
+
+def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
+    """Save 2-D PCA scatter plots of demographic embeddings."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get field names and their display names
+    field_display_names = {
+        "age": "Age",
+        "gender": "Gender", 
+        "ethnicity": "Ethnicity simplified",
+        "country_birth": "Country of birth",
+        "country_residence": "Country of residence", 
+        "nationality": "Nationality",
+        "student": "Student status",
+        "employment": "Employment status"
+    }
+
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            continue
+            
+        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
+        
+        emb = emb_layer.weight.detach().cpu().numpy()
+        if emb.shape[0] <= 2:
+            continue
+        emb = emb[2:]  # Skip PAD and UNK
+        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
+        if len(labels) != emb.shape[0]:
+            continue
+        
+        X = emb - emb.mean(axis=0, keepdims=True)
+        U, S, Vt = np.linalg.svd(X, full_matrices=False)
+        coords = X.dot(Vt.T[:, :2])
+
+        plt.figure(figsize=(8, 6))
+        plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
+        for i, label in enumerate(labels):
+            if i % max(1, len(labels)//30) == 0:
+                plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
+        plt.title(f"{display_name} Embeddings (PCA-2D)")
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {display_name} embedding visualisation → {fname}")
+
 
 if __name__ == "__main__":
-    main()
-    # Uncomment to generate submission files after training:
-    # generate_submission_files()
-    
-    # predict_example()  # Uncomment to run example inference 
+    parser = argparse.ArgumentParser(description="Fine-tune SentenceTransformer on Paraphrase detection (soft labels).")
+    parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
+    parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
+    parser.add_argument("--model_name", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model name")
+    parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
+    parser.add_argument("--lambda_kl", type=float, default=0.3, help="Weight for KL in mixed loss (0=L1 only)")
+    parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
+    parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
+    parser.add_argument("--patience", type=int, default=3, help="Number of epochs without improvement for early stopping")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler")
+    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
+    parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
+
+    args = parser.parse_args()
+    train(args) 
