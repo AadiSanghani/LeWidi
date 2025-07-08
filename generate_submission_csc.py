@@ -4,7 +4,10 @@ from pathlib import Path
 
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer
+
+# Import our custom model
+from train_roberta_csc import CSCDemogModel, CSCDataset
 
 
 def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
@@ -19,10 +22,40 @@ def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
+    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir)
+    
+    # Create a dummy dataset instance to get vocabulary info
+    # We need this to know the vocab sizes for our custom model
+    dummy_dataset = CSCDataset(
+        args.test_file,  # Use test file to build vocab (it will be the same as training)
+        tokenizer,
+        args.annot_meta,
+        max_length=args.max_length
+    )
+    
+    # Load our custom model
+    model = CSCDemogModel(
+        base_name=args.model_name,
+        vocab_sizes=dummy_dataset.vocab_sizes,
+        dem_dim=args.dem_dim,
+        dropout_rate=args.dropout_rate
+    )
+    
+    # Load the trained weights
+    model_state = torch.load(
+        f"{args.model_dir}/pytorch_model.bin", 
+        map_location=device
+    )
+    model.load_state_dict(model_state)
     model.to(device)
     model.eval()
+    
+    # We'll use UNK demographic values for inference since we don't have annotator-specific info
+    unk_demographics = {
+        f"{field}_ids": torch.tensor([CSCDataset.UNK_IDX], device=device)
+        for field in dummy_dataset.active_field_keys
+    }
 
     with open(args.test_file, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -37,8 +70,18 @@ def main(args):
         for ex_id, ex in tqdm(data.items(), desc="Predicting"):
             text = build_input(ex, tokenizer)
             enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
+            
+            # Prepare demographic inputs for batch size 1
+            batch_demographics = {}
+            for field in dummy_dataset.active_field_keys:
+                batch_demographics[f"{field}_ids"] = torch.tensor([CSCDataset.UNK_IDX], device=device)
+            
             with torch.no_grad():
-                logits = model(**enc).logits
+                logits = model(
+                    input_ids=enc["input_ids"],
+                    attention_mask=enc["attention_mask"],
+                    **batch_demographics
+                )
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
@@ -77,5 +120,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--num_bins", type=int, default=7, help="Number of bins to output for task A.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
+    
+    # Additional arguments needed for our custom model
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="Base model name used during training")
+    parser.add_argument("--annot_meta", type=str, default="dataset/CSC/CSC_annotators_meta.json", help="Path to annotator metadata JSON")
+    parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of demographic embeddings (must match training)")
+    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate (must match training)")
+    
     args = parser.parse_args()
     main(args) 
