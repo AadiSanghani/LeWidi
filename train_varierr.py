@@ -59,26 +59,41 @@ class VariErrNLI_Dataset(Dataset):
             return_tensors='pt'
         )
         if self.task_type == "soft_label":
-            # Build a 3-class vector [contradiction, entailment, neutral]
-            soft_label_dict = item['soft_label']
-            # For each class, average the values across annotators
-            soft_label = []
-            for label in NLI_LABELS:
-                # Get all values for this label (as floats)
-                label_scores = list(soft_label_dict[label].values())
-                avg_score = sum(float(x) for x in label_scores) / len(label_scores) if label_scores else 0.0
-                soft_label.append(avg_score)
-            soft_label = torch.tensor(soft_label, dtype=torch.float)
+            # Multi-label: for each annotator, create a multi-hot vector, then average across annotators
+            annotator_list = [a.strip() for a in item['annotators'].split(',')]
+            annotations_dict = item['annotations']
+            multi_hot_vectors = []
+            for ann in annotator_list:
+                label_str = annotations_dict[ann]
+                label_vec = [0, 0, 0]
+                for label in label_str.split(','):
+                    label = label.strip()
+                    if label in NLI_LABEL2IDX:
+                        label_vec[NLI_LABEL2IDX[label]] = 1
+                multi_hot_vectors.append(label_vec)
+            if multi_hot_vectors:
+                # Average across annotators to get soft multi-label
+                soft_label = torch.tensor(multi_hot_vectors, dtype=torch.float).mean(dim=0)
+            else:
+                soft_label = torch.zeros(3, dtype=torch.float)
             labels = soft_label
             annotator_ids = []
         else:
-            # Perspectivist: map each annotator's label to int, pad to MAX_ANNOTATORS with -100
+            # Perspectivist: multi-hot for each annotator, pad to MAX_ANNOTATORS
             annotator_list = [a.strip() for a in item['annotators'].split(',')]
             annotations_dict = item['annotations']
-            annotations = [NLI_LABEL2IDX[annotations_dict[ann]] for ann in annotator_list]
-            while len(annotations) < MAX_ANNOTATORS:
-                annotations.append(-100)
-            labels = torch.tensor(annotations, dtype=torch.float)
+            annotator_labels = []
+            for ann in annotator_list:
+                label_str = annotations_dict[ann]
+                label_vec = [0, 0, 0]
+                for label in label_str.split(','):
+                    label = label.strip()
+                    if label in NLI_LABEL2IDX:
+                        label_vec[NLI_LABEL2IDX[label]] = 1
+                annotator_labels.append(label_vec)
+            while len(annotator_labels) < MAX_ANNOTATORS:
+                annotator_labels.append([-100, -100, -100])
+            labels = torch.tensor(annotator_labels, dtype=torch.float)
             annotator_ids = []
         return {
             'input_ids': encoding['input_ids'].squeeze(),
@@ -124,16 +139,22 @@ class RoBERTaForLeWiDi(nn.Module):
         loss = None
         if labels is not None:
             if self.task_type == "soft_label":
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = F.kl_div(log_probs, labels, reduction='batchmean')
+                # logits: [batch_size, num_classes], labels: [batch_size, num_classes]
+                loss = F.binary_cross_entropy_with_logits(logits, labels)
             else:
+                # logits: [batch_size, num_annotators * num_classes] -> [batch_size, num_annotators, num_classes]
                 logits = logits.view(-1, self.num_annotators, self.num_classes)
-                loss = F.cross_entropy(logits.view(-1, self.num_classes), 
-                                     labels.long().view(-1), ignore_index=-100)
+                # labels: [batch_size, num_annotators, num_classes]
+                # Mask out padded annotators
+                mask = (labels != -100)
+                # Only compute loss for valid annotators
+                valid_logits = logits[mask].view(-1, self.num_classes)
+                valid_labels = labels[mask].view(-1, self.num_classes)
+                loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
         return {
             'loss': loss,
             'logits': logits,
-            'predictions': F.softmax(logits, dim=-1) if self.task_type == "soft_label" else logits
+            'predictions': torch.sigmoid(logits)
         }
 
 class LeWiDiTrainer:
