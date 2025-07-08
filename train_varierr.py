@@ -238,7 +238,12 @@ class SBertForLeWiDi(nn.Module):
         else:
             if num_annotators is None:
                 raise ValueError("num_annotators must be provided for perspectivist task_type.")
-            self.classifier = nn.Linear(embedding_dim, num_classes * num_annotators)
+            if use_demographics:
+                # For demographics, we process each sample-annotator pair separately
+                self.classifier = nn.Linear(embedding_dim, num_classes)
+            else:
+                # Original perspectivist logic
+                self.classifier = nn.Linear(embedding_dim, num_classes * num_annotators)
     
     def forward(self, texts, labels=None, annotator_ids=None, demographic_embeddings=None):
         # texts: list of strings
