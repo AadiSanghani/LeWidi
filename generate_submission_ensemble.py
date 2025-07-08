@@ -3,8 +3,10 @@ import json
 import os
 from pathlib import Path
 from collections import Counter
+from typing import List, Dict, Any
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 from sentence_transformers import SentenceTransformer
 
@@ -90,6 +92,8 @@ class CrossAttentionParModel(torch.nn.Module):
 
     def forward(self, *, texts, **demographic_inputs):
         text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+        # Convert to regular tensor for backpropagation
+        text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
         text_embeddings = self.text_proj(text_embeddings)
         
         demographic_vectors = []

@@ -154,6 +154,8 @@ class CrossAttentionParModel(torch.nn.Module):
 
     def forward(self, *, texts, **demographic_inputs):
         text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+        # Convert to regular tensor for backpropagation
+        text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
         text_embeddings = self.text_proj(text_embeddings)
         
         # Get demographic embeddings
@@ -208,6 +210,8 @@ class SimpleConcatParModel(torch.nn.Module):
 
     def forward(self, *, texts, **demographic_inputs):
         text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+        # Convert to regular tensor for backpropagation
+        text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
         
         demographic_vectors = []
         for field, emb_layer in self.demographic_embeddings.items():
@@ -263,6 +267,8 @@ class DemographicOnlyModel(torch.nn.Module):
 
     def forward(self, *, texts, **demographic_inputs):
         text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+        # Convert to regular tensor for backpropagation
+        text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
         text_embeddings = self.text_proj(text_embeddings)
         
         demographic_vectors = []
