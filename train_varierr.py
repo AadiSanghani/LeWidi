@@ -281,7 +281,7 @@ class SBertForLeWiDi(nn.Module):
                     # Flatten mask to match logits shape
                     flat_mask = mask.view(-1)
                     # Apply mask to both logits and labels
-                    valid_logits = logits[flat_mask]  # Select valid logits
+                    valid_logits = logits[flat_mask, :]  # Select valid logits (keep all classes)
                     valid_labels = labels[mask].view(-1, self.num_classes)  # Select valid labels
                     loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
                     # Reshape logits back for output
