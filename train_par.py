@@ -310,7 +310,6 @@ def generate_submission_files():
     # Generate Task A (Soft Label) submission
     print("Generating Task A (Soft Label) submission...")
     soft_model_path = 'models/par_soft_label_sbert'
-    tokenizer = SentenceTransformer(soft_model_path)
     model = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='soft_label')
     trainer = LeWiDiTrainer(model)
     trainer.load_model(soft_model_path)
@@ -324,37 +323,28 @@ def generate_submission_files():
             question1 = ex['text']['Question1']
             question2 = ex['text']['Question2']
             text = f"{question1} [SEP] {question2}"
-            
-            # Tokenize and predict
-            enc = tokenizer.encode(text, convert_to_tensor=True).to(device)
             with torch.no_grad():
-                outputs = model(enc)
+                outputs = model([text])
                 probs = outputs['predictions'].squeeze(0).cpu()
-            
             # Format output
             out_probs = probs.tolist()
             # Ensure we output exactly num_bins probabilities
             if len(out_probs) < num_bins:
                 pad = [0.0] * (num_bins - len(out_probs))
                 out_probs = pad + out_probs
-            
             # Round to 10 decimals and fix any rounding drift
             out_probs = [round(p, 10) for p in out_probs]
             drift = 1.0 - sum(out_probs)
             if abs(drift) > 1e-10:
-                # add drift to the max prob to keep list summing to 1
                 idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
                 out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
-            
             prob_str = ",".join(f"{p:.10f}" for p in out_probs)
             out_f.write(f"{idx}\t[{prob_str}]\n")
-    
     print(f"Saved Task A submission file to {output_file}")
     
     # Generate Task B (Perspectivist) submission
     print("Generating Task B (Perspectivist) submission...")
     pe_model_path = 'models/par_perspectivist_sbert'
-    tokenizer_pe = SentenceTransformer(pe_model_path)
     model_pe = SBertForLeWiDi('all-MiniLM-L6-v2', num_classes=num_bins, task_type='perspectivist', num_annotators=MAX_ANNOTATORS)
     trainer_pe = LeWiDiTrainer(model_pe)
     trainer_pe.load_model(pe_model_path)
@@ -364,31 +354,20 @@ def generate_submission_files():
     output_file_pe = 'Paraphrase_test_pe.tsv'
     with open(output_file_pe, "w", encoding="utf-8") as out_f:
         for idx, ex in tqdm(enumerate(data), desc="Task B predictions"):
-            # Build input text
             question1 = ex['text']['Question1']
             question2 = ex['text']['Question2']
             text = f"{question1} [SEP] {question2}"
-            
-            # Get annotator list
             ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
-            
-            # Tokenize and predict
-            enc = tokenizer_pe.encode(text, convert_to_tensor=True).to(device)
             with torch.no_grad():
-                outputs = model_pe(enc)
-                # outputs['predictions']: [1, MAX_ANNOTATORS, num_bins]
+                outputs = model_pe([text])
                 preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
-            
-            # For each annotator, get the predicted rating (argmax - 5 for Likert scale)
             annotator_preds = []
             for i in range(len(ann_list)):
                 rating_idx = torch.argmax(preds[i]).item()
                 rating = rating_idx - 5  # Convert to Likert scale -5 to 5
                 annotator_preds.append(str(rating))
-            
             preds_str = ", ".join(annotator_preds)
             out_f.write(f"{idx}\t[{preds_str}]\n")
-    
     print(f"Saved Task B submission file to {output_file_pe}")
     print("To submit: zip -j res.zip", output_file, output_file_pe)
 
