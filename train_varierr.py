@@ -80,6 +80,9 @@ class VariErrNLI_Dataset(Dataset):
                     if label in NLI_LABEL2IDX:
                         label_vec[NLI_LABEL2IDX[label]] = 1
                 annotator_labels.append(label_vec)
+            # Truncate if too many annotators, pad if too few
+            if len(annotator_labels) > MAX_ANNOTATORS:
+                annotator_labels = annotator_labels[:MAX_ANNOTATORS]
             while len(annotator_labels) < MAX_ANNOTATORS:
                 annotator_labels.append([-100, -100, -100])
             labels = torch.tensor(annotator_labels, dtype=torch.float)
