@@ -259,17 +259,33 @@ class SBertForLeWiDi(nn.Module):
                 log_probs = F.log_softmax(logits, dim=-1)
                 loss = F.kl_div(log_probs, labels, reduction='batchmean')
             else:
-                # For perspectivist, reshape logits back to [batch_size, num_annotators, num_classes]
-                logits = logits.view(-1, self.num_annotators, self.num_classes)
-                labels_shifted = labels.clone()
-                mask = (labels != -100)
-                labels_shifted[mask] = labels[mask] + 5
-                labels_shifted = labels_shifted.long()
-                loss = F.cross_entropy(
-                    logits.view(-1, self.num_classes),
-                    labels_shifted.view(-1),
-                    ignore_index=-100
-                )
+                # For perspectivist, handle the expanded logits properly
+                if self.use_demographics and demographic_embeddings is not None:
+                    # Logits are already [batch_size * num_annotators, num_classes]
+                    # Labels are [batch_size, num_annotators], need to flatten
+                    labels_shifted = labels.clone()
+                    mask = (labels != -100)
+                    labels_shifted[mask] = labels[mask] + 5
+                    labels_shifted = labels_shifted.long()
+                    loss = F.cross_entropy(
+                        logits,  # Already [batch_size * num_annotators, num_classes]
+                        labels_shifted.view(-1),  # Flatten to [batch_size * num_annotators]
+                        ignore_index=-100
+                    )
+                    # Reshape logits back for output
+                    logits = logits.view(-1, self.num_annotators, self.num_classes)
+                else:
+                    # Original perspectivist logic without demographics
+                    logits = logits.view(-1, self.num_annotators, self.num_classes)
+                    labels_shifted = labels.clone()
+                    mask = (labels != -100)
+                    labels_shifted[mask] = labels[mask] + 5
+                    labels_shifted = labels_shifted.long()
+                    loss = F.cross_entropy(
+                        logits.view(-1, self.num_classes),
+                        labels_shifted.view(-1),
+                        ignore_index=-100
+                    )
         
         return {
             'loss': loss,

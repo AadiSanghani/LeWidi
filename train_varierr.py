@@ -273,11 +273,23 @@ class SBertForLeWiDi(nn.Module):
             if self.task_type == "soft_label":
                 loss = F.binary_cross_entropy_with_logits(logits, labels)
             else:
-                logits = logits.view(-1, self.num_annotators, self.num_classes)
-                mask = (labels != -100)
-                valid_logits = logits[mask].view(-1, self.num_classes)
-                valid_labels = labels[mask].view(-1, self.num_classes)
-                loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
+                # For perspectivist, handle the expanded logits properly
+                if self.use_demographics and demographic_embeddings is not None:
+                    # Logits are already [batch_size * num_annotators, num_classes]
+                    # Labels are [batch_size, num_annotators], need to flatten
+                    mask = (labels != -100)
+                    valid_logits = logits[mask.view(-1)]  # Flatten mask and apply to logits
+                    valid_labels = labels[mask].view(-1, self.num_classes)
+                    loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
+                    # Reshape logits back for output
+                    logits = logits.view(-1, self.num_annotators, self.num_classes)
+                else:
+                    # Original perspectivist logic without demographics
+                    logits = logits.view(-1, self.num_annotators, self.num_classes)
+                    mask = (labels != -100)
+                    valid_logits = logits[mask].view(-1, self.num_classes)
+                    valid_labels = labels[mask].view(-1, self.num_classes)
+                    loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
         
         return {
             'loss': loss,
