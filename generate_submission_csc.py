@@ -27,8 +27,11 @@ def main(args):
     
     # Create a dummy dataset instance to get vocabulary info
     # We need this to know the vocab sizes for our custom model
+    # For inference, we'll use a training file to build the vocabulary
+    # since test files don't have valid soft labels
+    train_file = args.test_file.replace("_test_clear.json", "_train.json")
     dummy_dataset = CSCDataset(
-        args.test_file,  # Use test file to build vocab (it will be the same as training)
+        train_file,  # Use train file to build vocab
         tokenizer,
         args.annot_meta,
         max_length=args.max_length
