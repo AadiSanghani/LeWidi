@@ -96,6 +96,9 @@ class CrossAttentionParModel(torch.nn.Module):
         text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
         text_embeddings = self.text_proj(text_embeddings)
         
+        # Add sequence dimension for cross-attention (batch_size, 1, embedding_dim)
+        text_embeddings = text_embeddings.unsqueeze(1)
+        
         demographic_vectors = []
         for field, emb_layer in self.demographic_embeddings.items():
             field_key = f"{field}_ids"
@@ -109,8 +112,9 @@ class CrossAttentionParModel(torch.nn.Module):
             for cross_attn in self.cross_attention_layers:
                 text_embeddings = cross_attn(text_embeddings, dem_emb)
         
-        pooled = torch.mean(text_embeddings, dim=1)
-        logits = self.classifier(pooled)
+        # Remove sequence dimension
+        text_embeddings = text_embeddings.squeeze(1)
+        logits = self.classifier(text_embeddings)
         return logits
 
 
