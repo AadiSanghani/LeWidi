@@ -117,6 +117,8 @@ class CrossAttentionParModel(torch.nn.Module):
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
         emb_dim = self.text_model.get_sentence_embedding_dimension()
+        if emb_dim is None:
+            emb_dim = 768  # Default fallback
         emb_dim = int(emb_dim)
         
         # Project text embeddings
@@ -195,6 +197,8 @@ class SimpleConcatParModel(torch.nn.Module):
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
         emb_dim = self.text_model.get_sentence_embedding_dimension()
+        if emb_dim is None:
+            emb_dim = 768  # Default fallback
         emb_dim = int(emb_dim)
         
         num_demog_fields = len(vocab_sizes)
@@ -249,6 +253,8 @@ class DemographicOnlyModel(torch.nn.Module):
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
         emb_dim = self.text_model.get_sentence_embedding_dimension()
+        if emb_dim is None:
+            emb_dim = 768  # Default fallback
         emb_dim = int(emb_dim)
         
         # Smaller text projection, larger demographic influence
@@ -545,10 +551,12 @@ def ensemble_evaluate(model, dataloader, device):
     for key in total_metrics:
         total_metrics[key] /= n_examples
     
-    total_metrics['predictions'] = all_predictions
-    total_metrics['targets'] = all_targets
+    # Convert defaultdict to regular dict to avoid type issues
+    result_metrics = dict(total_metrics)
+    result_metrics['predictions'] = all_predictions
+    result_metrics['targets'] = all_targets
     
-    return total_metrics
+    return result_metrics
 
 
 def train_ensemble(args):
@@ -571,11 +579,12 @@ def train_ensemble(args):
     print(f"Using demographic fields: {list(train_ds.active_field_keys.keys())}")
     print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
 
-    # Model configurations for ensemble
+    # Model configurations for ensemble - Better models for paraphrase detection
     model_configs = [
-        {'base_name': 'all-mpnet-base-v2', 'model_type': 'cross_attention'},
-        {'base_name': 'all-MiniLM-L12-v2', 'model_type': 'simple_concat'},
-        {'base_name': 'multi-qa-mpnet-base-dot-v1', 'model_type': 'demographic_only'},
+        {'base_name': 'all-mpnet-base-v2', 'model_type': 'cross_attention'},  # Best SBERT for semantic similarity
+        {'base_name': 'roberta-base', 'model_type': 'simple_concat'},  # RoBERTa base
+        {'base_name': 'sentence-transformers/all-MiniLM-L6-v2', 'model_type': 'demographic_only'},  # Fast SBERT
+        {'base_name': 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2', 'model_type': 'cross_attention'},  # Paraphrase-specific SBERT
     ]
 
     print(f"Creating ensemble with {len(model_configs)} models:")
