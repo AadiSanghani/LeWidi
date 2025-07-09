@@ -15,10 +15,10 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 
-class ParDemogModel(torch.nn.Module):
-    """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware paraphrase detection."""
+class EnsembleParDemogModel(torch.nn.Module):
+    """RoBERTa-Large model with ensemble of pretrained models and demographic embeddings."""
     
-    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3, num_classes: int = 11):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, dropout_rate: float = 0.3, num_classes: int = 11):
         super().__init__()
         from transformers import AutoModel, AutoTokenizer
         from sentence_transformers import SentenceTransformer
@@ -27,12 +27,32 @@ class ParDemogModel(torch.nn.Module):
         self.roberta_model = AutoModel.from_pretrained(base_name)
         self.tokenizer = AutoTokenizer.from_pretrained(base_name)
         
-        # SBERT model for additional embeddings
-        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+        # Ensemble of pretrained models (frozen feature extractors)
+        self.ensemble_models = torch.nn.ModuleDict()
         
-        # Freeze SBERT model parameters
-        for param in self.sbert_model.parameters():
-            param.requires_grad = False
+        # SBERT models
+        self.ensemble_models['sbert_minilm'] = SentenceTransformer("all-MiniLM-L6-v2")
+        self.ensemble_models['sbert_mpnet'] = SentenceTransformer("all-mpnet-base-v2")
+        self.ensemble_models['sbert_roberta'] = SentenceTransformer("all-distilroberta-v1")
+        
+        # Additional transformer models for diversity
+        try:
+            self.ensemble_models['deberta'] = AutoModel.from_pretrained("microsoft/deberta-base")
+            self.ensemble_models['deberta_tokenizer'] = AutoTokenizer.from_pretrained("microsoft/deberta-base")
+        except:
+            print("Warning: Could not load DeBERTa model")
+        
+        try:
+            self.ensemble_models['bert'] = AutoModel.from_pretrained("bert-base-uncased")
+            self.ensemble_models['bert_tokenizer'] = AutoTokenizer.from_pretrained("bert-base-uncased")
+        except:
+            print("Warning: Could not load BERT model")
+        
+        # Freeze all ensemble models
+        for model in self.ensemble_models.values():
+            if hasattr(model, 'parameters'):
+                for param in model.parameters():
+                    param.requires_grad = False
         
         self.num_classes = num_classes
         
@@ -41,29 +61,82 @@ class ParDemogModel(torch.nn.Module):
         for field, vocab_size in vocab_sizes.items():
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
-        # Get embedding dimension from RoBERTa
+        # Get embedding dimensions
         roberta_dim = self.roberta_model.config.hidden_size  # Usually 1024 for RoBERTa-Large
         
-        # SBERT dimension (from all-MiniLM-L6-v2)
-        self.sbert_dim = sbert_dim
+        # Calculate ensemble dimensions
+        ensemble_dims = []
+        for name, model in self.ensemble_models.items():
+            if 'sbert' in name:
+                ensemble_dims.append(model.get_sentence_embedding_dimension())
+            elif name in ['deberta', 'bert']:
+                ensemble_dims.append(model.config.hidden_size)
         
+        total_ensemble_dim = sum(ensemble_dims)
         num_demog_fields = len(vocab_sizes)
-        total_dim = roberta_dim + sbert_dim + num_demog_fields * dem_dim
+        total_dim = roberta_dim + total_ensemble_dim + num_demog_fields * dem_dim
         
-        self.norm = torch.nn.LayerNorm(total_dim)
+        print(f"Model dimensions:")
+        print(f"  RoBERTa: {roberta_dim}")
+        print(f"  Ensemble: {total_ensemble_dim} ({ensemble_dims})")
+        print(f"  Demographics: {num_demog_fields * dem_dim}")
+        print(f"  Total: {total_dim}")
+        
+        # Feature fusion layers
+        self.feature_fusion = torch.nn.Sequential(
+            torch.nn.Linear(total_dim, total_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout_rate),
+            torch.nn.Linear(total_dim // 2, total_dim // 4),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout_rate)
+        )
+        
+        self.norm = torch.nn.LayerNorm(total_dim // 4)
         self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(total_dim, num_classes)
+        self.classifier = torch.nn.Linear(total_dim // 4, num_classes)
 
     def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
         # Get RoBERTa embeddings
         roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
         roberta_embeddings = roberta_outputs.last_hidden_state[:, 0, :]  # [CLS] token
         
-        # Get SBERT embeddings
-        with torch.no_grad():
-            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
+        # Get ensemble embeddings
+        ensemble_embeddings = []
         
-        # Get demographic embeddings dynamically
+        # SBERT models
+        with torch.no_grad():
+            for name, model in self.ensemble_models.items():
+                if 'sbert' in name:
+                    emb = model.encode(texts, convert_to_tensor=True)
+                    ensemble_embeddings.append(emb)
+        
+        # Additional transformer models
+        for name, model in self.ensemble_models.items():
+            if name in ['deberta', 'bert']:
+                try:
+                    tokenizer = self.ensemble_models[f'{name}_tokenizer']
+                    enc = tokenizer(
+                        texts,
+                        max_length=512,
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    enc = {k: v.to(roberta_embeddings.device) for k, v in enc.items()}
+                    
+                    with torch.no_grad():
+                        outputs = model(**enc)
+                        emb = outputs.last_hidden_state[:, 0, :]  # [CLS] token
+                        ensemble_embeddings.append(emb)
+                except Exception as e:
+                    print(f"Warning: Error with {name} model: {e}")
+                    # Use zero tensor as fallback
+                    emb_dim = model.config.hidden_size
+                    emb = torch.zeros(roberta_embeddings.shape[0], emb_dim, device=roberta_embeddings.device)
+                    ensemble_embeddings.append(emb)
+        
+        # Get demographic embeddings
         demographic_vectors = []
         for field, emb_layer in self.demographic_embeddings.items():
             field_key = f"{field}_ids"
@@ -71,13 +144,16 @@ class ParDemogModel(torch.nn.Module):
                 demographic_vec = emb_layer(demographic_inputs[field_key])
                 demographic_vectors.append(demographic_vec)
 
-        # Concatenate all vectors: RoBERTa + SBERT + demographics
-        all_vectors = [roberta_embeddings, sbert_embeddings] + demographic_vectors
+        # Concatenate all vectors: RoBERTa + Ensemble + Demographics
+        all_vectors = [roberta_embeddings] + ensemble_embeddings + demographic_vectors
         concat = torch.cat(all_vectors, dim=-1)
-            
-        concat = self.norm(concat)
-        concat = self.dropout(concat)
-        logits = self.classifier(concat)
+        
+        # Feature fusion
+        fused = self.feature_fusion(concat)
+        fused = self.norm(fused)
+        fused = self.dropout(fused)
+        
+        logits = self.classifier(fused)
         return logits
 
 
@@ -253,7 +329,7 @@ class ParDataset(Dataset):
             result = {
                 "input_ids": enc["input_ids"].squeeze(0),
                 "attention_mask": enc["attention_mask"].squeeze(0),
-                "texts": self.texts[idx],  # Keep original text for SBERT
+                "texts": self.texts[idx],  # Keep original text for ensemble models
                 "labels": torch.tensor(self.labels[idx], dtype=torch.long),
                 "dist": torch.tensor(self.dists[idx], dtype=torch.float),
             }
@@ -352,156 +428,6 @@ def evaluate(model, dataloader, device):
     return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets
 
 
-def analyze_predictions(predictions, targets, epoch, output_dir):
-    """Analyze prediction distributions and save plots."""
-    predictions = np.array(predictions)
-    targets = np.array(targets)
-    
-    # Calculate prediction bias (for class 5, which is the highest rating)
-    pred_bias = np.mean(predictions[:, 10] - targets[:, 10])  # bias toward class 5
-    pred_std = np.std(predictions[:, 10])
-    target_std = np.std(targets[:, 10])
-    
-    # Create analysis plots
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Plot 1: Prediction vs Target scatter (for highest class)
-    axes[0, 0].scatter(targets[:, 10], predictions[:, 10], alpha=0.5, s=1)
-    axes[0, 0].plot([0, 1], [0, 1], 'r--', alpha=0.8)
-    axes[0, 0].set_xlabel('True P(rating=5)')
-    axes[0, 0].set_ylabel('Predicted P(rating=5)')
-    axes[0, 0].set_title(f'Epoch {epoch}: Prediction vs Target')
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Prediction distribution
-    axes[0, 1].hist(predictions[:, 10], bins=50, alpha=0.7, label='Predictions')
-    axes[0, 1].hist(targets[:, 10], bins=50, alpha=0.7, label='Targets')
-    axes[0, 1].set_xlabel('P(rating=5)')
-    axes[0, 1].set_ylabel('Count')
-    axes[0, 1].set_title(f'Epoch {epoch}: Distribution Comparison')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Error distribution
-    errors = predictions[:, 10] - targets[:, 10]
-    axes[1, 0].hist(errors, bins=50, alpha=0.7)
-    axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.8)
-    axes[1, 0].set_xlabel('Prediction Error')
-    axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (bias={pred_bias:.3f})')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Plot 4: Error vs Target
-    axes[1, 1].scatter(targets[:, 10], errors, alpha=0.5, s=1)
-    axes[1, 1].axhline(0, color='red', linestyle='--', alpha=0.8)
-    axes[1, 1].set_xlabel('True P(rating=5)')
-    axes[1, 1].set_ylabel('Prediction Error')
-    axes[1, 1].set_title(f'Epoch {epoch}: Error vs Target')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'epoch_{epoch}_analysis.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    return {
-        'pred_bias': pred_bias,
-        'pred_std': pred_std,
-        'target_std': target_std,
-        'mean_error': np.mean(np.abs(errors))
-    }
-
-
-def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
-    """Plot and save training metrics and curves."""
-    epochs_range = list(range(1, len(train_loss_history) + 1))
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-    # Training loss vs validation distance
-    ax_comb = axes[0, 0]
-    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-    if val_dist_history:
-        ax_comb_twin = ax_comb.twinx()
-        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
-        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
-    ax_comb.set_title('Training Loss vs Validation Distance')
-    ax_comb.set_xlabel('Epoch')
-    ax_comb.set_ylabel('Training Loss', color='blue')
-    ax_comb.tick_params(axis='y', labelcolor='blue')
-    ax_comb.grid(True, alpha=0.3)
-
-    # Validation distance with best epoch marker
-    if val_dist_history:
-        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
-        axes[0, 1].set_title('Validation Manhattan Distance')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Distance')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
-        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
-
-    # Learning rate schedule
-    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
-    axes[1, 0].set_title('Learning Rate Schedule')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Learning Rate')
-    axes[1, 0].set_yscale('log')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Analysis metrics
-    if analysis_history:
-        biases = [a['pred_bias'] for a in analysis_history]
-        errors = [a['mean_error'] for a in analysis_history]
-        axes[1, 1].plot(epochs_range, biases, marker='o', label='Prediction Bias', color='purple')
-        axes[1, 1].plot(epochs_range, errors, marker='s', label='Mean Abs Error', color='brown')
-        axes[1, 1].set_title('Prediction Analysis')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Metric Value')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Separate combined plot for quick reference
-    if val_dist_history:
-        fig2, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Train Loss', color='blue')
-        ax1.tick_params(axis='y', labelcolor='blue')
-        ax2 = ax1.twinx()
-        ax2.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax2.set_ylabel('Validation Distance', color='orange')
-        ax2.tick_params(axis='y', labelcolor='orange')
-        ax1.set_title('Train Loss vs Val Distance')
-        ax1.grid(True, alpha=0.3)
-        fig2.tight_layout()
-        fig2.savefig(os.path.join(output_dir, 'loss_vs_val.png'), dpi=150, bbox_inches='tight')
-        plt.close(fig2)
-
-    # Save metrics to JSON
-    metrics = {
-        'train_loss': [float(x) for x in train_loss_history],
-        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
-        'learning_rates': [float(x) for x in lr_history],
-        'analysis': [
-            {
-                'pred_bias': float(a['pred_bias']),
-                'pred_std': float(a['pred_std']),
-                'target_std': float(a['target_std']),
-                'mean_error': float(a['mean_error'])
-            } for a in analysis_history
-        ],
-        'best_epoch': int(best_epoch) if val_dist_history else None,
-        'best_metric': float(best_metric) if val_dist_history else None
-    }
-    
-    with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -531,11 +457,10 @@ def train(args):
         DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
     )
 
-    model = ParDemogModel(
+    model = EnsembleParDemogModel(
         base_name=args.model_name,
         vocab_sizes=train_ds.vocab_sizes,
         dem_dim=args.dem_dim,
-        sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
         num_classes=args.num_classes,
     )
@@ -565,7 +490,6 @@ def train(args):
     train_loss_history = []
     val_dist_history = []
     lr_history = []
-    analysis_history = []
 
     print(f"Total training steps: {total_steps}")
     print(f"Warmup steps: {warmup_steps}")
@@ -611,15 +535,6 @@ def train(args):
         if val_loader:
             val_dist, predictions, targets = evaluate(model, val_loader, device)
             print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
-            
-            analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
-            analysis_history.append(analysis)
-            
-            print(f"Epoch {epoch} Analysis:")
-            print(f"  Prediction bias: {analysis['pred_bias']:.4f}")
-            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
-            print(f"  Prediction std: {analysis['pred_std']:.4f}")
-            print(f"  Target std: {analysis['target_std']:.4f}")
             
             if val_dist < best_metric:
                 best_metric = val_dist
@@ -671,72 +586,17 @@ def train(args):
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
 
-    visualize_demog_embeddings(model, train_ds, args.output_dir)
-    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
-
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
     if val_dist_history:
         print(f"Best epoch: {best_epoch}")
 
 
-def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
-    """Save 2-D PCA scatter plots of demographic embeddings."""
-    import matplotlib.pyplot as plt
-    import numpy as np
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Get field names and their display names
-    field_display_names = {
-        "age": "Age",
-        "gender": "Gender", 
-        "ethnicity": "Ethnicity simplified",
-        "country_birth": "Country of birth",
-        "country_residence": "Country of residence", 
-        "nationality": "Nationality",
-        "student": "Student status",
-        "employment": "Employment status"
-    }
-
-    for field_name, emb_layer in model.demographic_embeddings.items():
-        if field_name not in dataset.vocab:
-            continue
-            
-        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
-        
-        emb = emb_layer.weight.detach().cpu().numpy()
-        if emb.shape[0] <= 2:
-            continue
-        emb = emb[2:]  # Skip PAD and UNK
-        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
-        if len(labels) != emb.shape[0]:
-            continue
-        
-        X = emb - emb.mean(axis=0, keepdims=True)
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        coords = X.dot(Vt.T[:, :2])
-
-        plt.figure(figsize=(8, 6))
-        plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
-        for i, label in enumerate(labels):
-            if i % max(1, len(labels)//30) == 0:
-                plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-        plt.title(f"{display_name} Embeddings (PCA-2D)")
-        plt.xlabel("PC1")
-        plt.ylabel("PC2")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Saved {display_name} embedding visualisation → {fname}")
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings and demographic features on Paraphrase detection using cross-entropy loss.")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with ensemble of pretrained models and demographic features on Paraphrase detection using cross-entropy loss.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
     parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa model name")
-    parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
+    parser.add_argument("--output_dir", type=str, default="runs/outputs_par_ensemble")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=15)
@@ -744,7 +604,6 @@ if __name__ == "__main__":
     parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
-    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
     parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
