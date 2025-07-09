@@ -569,7 +569,9 @@ def train(args):
     analysis_history = []
 
     print(f"Total training steps: {total_steps}")
+    print(f"Warmup steps: {warmup_steps}")
     print(f"Initial learning rate: {args.lr}")
+    print(f"Early stopping patience: {args.patience} epochs")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -594,7 +596,7 @@ def train(args):
             loss = F.cross_entropy(logits, batch["labels"])
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimiser.step()
             scheduler.step()
             optimiser.zero_grad()
@@ -602,7 +604,7 @@ def train(args):
             epoch_loss += loss.item()
             step_count += 1
             
-            if step % 100 == 0:
+            if step % 50 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 avg_loss = epoch_loss / step_count
                 tqdm.write(f"Epoch {epoch} step {step}: loss={avg_loss:.4f}, lr={current_lr:.2e}")
@@ -627,7 +629,24 @@ def train(args):
                 save_path = os.path.join(args.output_dir, "best_model")
                 os.makedirs(save_path, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
-                print(f"New best model saved to {save_path}")
+                
+                # Save training metadata
+                metadata = {
+                    "best_epoch": best_epoch,
+                    "best_metric": best_metric,
+                    "training_config": {
+                        "lr": args.lr,
+                        "epochs": args.epochs,
+                        "batch_size": args.batch_size,
+                        "model_name": args.model_name,
+                        "patience": args.patience,
+                        "warmup_ratio": args.warmup_ratio
+                    }
+                }
+                with open(os.path.join(save_path, "metadata.json"), "w") as f:
+                    json.dump(metadata, f, indent=2)
+                
+                print(f"New best model saved to {save_path} (metric: {best_metric:.4f})")
             else:
                 epochs_no_improve += 1
 
@@ -636,8 +655,17 @@ def train(args):
             val_dist_history.append(val_dist)
         lr_history.append(scheduler.get_last_lr()[0])
 
+        # Print epoch summary
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Training Loss: {epoch_loss / step_count:.4f}")
+        if val_loader:
+            print(f"  Validation Distance: {val_dist:.4f}")
+        print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+        print(f"  Epochs without improvement: {epochs_no_improve}")
+
         if epochs_no_improve >= args.patience:
-            print(f"Early stopping at epoch {epoch}")
+            print(f"\nEarly stopping triggered after {epoch} epochs")
+            print(f"Best validation distance: {best_metric:.4f} at epoch {best_epoch}")
             break
 
     final_path = os.path.join(args.output_dir, "last_model")
@@ -712,15 +740,15 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
-    parser.add_argument("--patience", type=int, default=3, help="Number of epochs without improvement for early stopping")
+    parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler")
+    parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
     parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
 
