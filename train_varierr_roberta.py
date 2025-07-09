@@ -2,122 +2,170 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sentence_transformers import SentenceTransformer, losses, InputExample
-from transformers import RobertaTokenizer, RobertaModel
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 import os
 from typing import List, Tuple, Optional, Dict
 import warnings
 import json
 from tqdm import tqdm
+from torch.optim import AdamW
 warnings.filterwarnings('ignore')
 
 MAX_ANNOTATORS = 5  # Maximum number of annotators for VariErrNLI
 NLI_LABELS = ["contradiction", "entailment", "neutral"]
 NLI_LABEL2IDX = {label: idx for idx, label in enumerate(NLI_LABELS)}
 
-class DemographicsEncoder:
-    """Encode demographic information into embeddings"""
-    def __init__(self, metadata_path: str, embedding_dim: int = 128):
-        self.embedding_dim = embedding_dim
-        self.metadata = self.load_metadata(metadata_path)
-        self.gender_encoder = nn.Embedding(3, embedding_dim // 4)  # Male, Female, Unknown
-        self.age_encoder = nn.Embedding(10, embedding_dim // 4)    # Age buckets
-        self.nationality_encoder = nn.Embedding(20, embedding_dim // 4)  # Nationality
-        self.education_encoder = nn.Embedding(10, embedding_dim // 4)    # Education level
-        
-        # Create mappings
-        self.gender_map = {"Male": 0, "Female": 1, "Unknown": 2}
-        self.nationality_map = self.create_nationality_map()
-        self.education_map = self.create_education_map()
-        
-    def load_metadata(self, metadata_path: str) -> Dict:
-        with open(metadata_path, 'r') as f:
-            content = f.read()
-            # Handle trailing commas in JSON by removing them
-            import re
-            content = re.sub(r',(\s*[}\]])', r'\1', content)
-            return json.loads(content)
+class VariErrNLIDemogModel(nn.Module):
+    """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware NLI."""
     
-    def create_nationality_map(self) -> Dict[str, int]:
-        nationalities = set()
-        for ann_data in self.metadata.values():
-            nationalities.add(ann_data.get("Nationality", "Unknown"))
-        return {nat: idx for idx, nat in enumerate(sorted(nationalities))}
-    
-    def create_education_map(self) -> Dict[str, int]:
-        educations = set()
-        for ann_data in self.metadata.values():
-            educations.add(ann_data.get("Education", "Unknown"))
-        return {edu: idx for idx, edu in enumerate(sorted(educations))}
-    
-    def get_age_bucket(self, age_str: str) -> int:
-        try:
-            age = int(age_str)
-            if age < 20: return 0
-            elif age < 25: return 1
-            elif age < 30: return 2
-            elif age < 35: return 3
-            elif age < 40: return 4
-            elif age < 45: return 5
-            elif age < 50: return 6
-            elif age < 55: return 7
-            elif age < 60: return 8
-            else: return 9
-        except:
-            return 0
-    
-    def encode_annotator(self, annotator_id: str) -> torch.Tensor:
-        if annotator_id not in self.metadata:
-            # Return zero embedding for unknown annotators
-            return torch.zeros(self.embedding_dim)
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 32, sbert_dim: int = 384, 
+                 dropout_rate: float = 0.3, num_classes: int = 3, task_type: str = "soft_label"):
+        super().__init__()
         
-        ann_data = self.metadata[annotator_id]
+        # RoBERTa-Large as the main model
+        self.roberta_model = AutoModel.from_pretrained(base_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(base_name)
         
-        gender_idx = self.gender_map.get(ann_data.get("Gender", "Unknown"), 2)
-        age_idx = self.get_age_bucket(ann_data.get("Age", "25"))
-        nationality_idx = self.nationality_map.get(ann_data.get("Nationality", "Unknown"), 0)
-        education_idx = self.education_map.get(ann_data.get("Education", "Unknown"), 0)
+        # SBERT model for additional embeddings
+        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
         
-        gender_emb = self.gender_encoder(torch.tensor(gender_idx))
-        age_emb = self.age_encoder(torch.tensor(age_idx))
-        nationality_emb = self.nationality_encoder(torch.tensor(nationality_idx))
-        education_emb = self.education_encoder(torch.tensor(education_idx))
+        # Freeze SBERT model parameters
+        for param in self.sbert_model.parameters():
+            param.requires_grad = False
         
-        return torch.cat([gender_emb, age_emb, nationality_emb, education_emb])
+        self.num_classes = num_classes
+        self.task_type = task_type
+        
+        # Create embeddings dynamically based on vocab_sizes
+        self.demographic_embeddings = torch.nn.ModuleDict()
+        for field, vocab_size in vocab_sizes.items():
+            self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
-class PreTrainedSBert:
-    """Pre-train SBERT model using RoBERTa-large as base"""
-    def __init__(self, base_model_name: str = "roberta-large", max_length: int = 512):
-        self.base_model_name = base_model_name
-        self.max_length = max_length
-        self.tokenizer = RobertaTokenizer.from_pretrained(base_model_name)
-        self.model = RobertaModel.from_pretrained(base_model_name)
+        # Get embedding dimension from RoBERTa
+        roberta_dim = self.roberta_model.config.hidden_size  # Usually 1024 for RoBERTa-Large
         
-    def create_sbert_model(self, save_path: str = "pretrained_sbert"):
-        """Create and save a pre-trained SBERT model"""
-        from sentence_transformers import SentenceTransformer
+        # SBERT dimension (from all-MiniLM-L6-v2)
+        self.sbert_dim = sbert_dim
         
-        # Create SBERT model from RoBERTa
-        sbert_model = SentenceTransformer(self.base_model_name)
+        num_demog_fields = len(vocab_sizes)
+        total_dim = roberta_dim + sbert_dim + num_demog_fields * dem_dim
         
-        # Save the model
-        os.makedirs(save_path, exist_ok=True)
-        sbert_model.save(save_path)
-        print(f"Pre-trained SBERT model saved to {save_path}")
-        return sbert_model
+        self.norm = torch.nn.LayerNorm(total_dim)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        
+        if task_type == "soft_label":
+            self.classifier = torch.nn.Linear(total_dim, num_classes)
+        else:
+            # For perspectivist, we need to handle multiple annotators
+            self.classifier = torch.nn.Linear(total_dim, num_classes)
+
+    def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
+        # Get RoBERTa embeddings
+        roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
+        roberta_embeddings = roberta_outputs.last_hidden_state[:, 0, :]  # [CLS] token
+        
+        # Get SBERT embeddings
+        with torch.no_grad():
+            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
+        
+        # Get demographic embeddings dynamically
+        demographic_vectors = []
+        for field, emb_layer in self.demographic_embeddings.items():
+            field_key = f"{field}_ids"
+            if field_key in demographic_inputs:
+                demographic_vec = emb_layer(demographic_inputs[field_key])
+                demographic_vectors.append(demographic_vec)
+
+        # Concatenate all vectors: RoBERTa + SBERT + demographics
+        all_vectors = [roberta_embeddings, sbert_embeddings] + demographic_vectors
+        concat = torch.cat(all_vectors, dim=-1)
+            
+        concat = self.norm(concat)
+        concat = self.dropout(concat)
+        logits = self.classifier(concat)
+        return logits
 
 class VariErrNLI_Dataset(Dataset):
     """Dataset class for VariErrNLI dataset with demographics support"""
-    def __init__(self, data_path: str, max_length: int = 512, 
+    
+    PAD_IDX = 0  # padding
+    UNK_IDX = 1  # unknown / missing
+
+    FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender",
+        "nationality": "Nationality",
+        "education": "Education",
+    }
+
+    @staticmethod
+    def get_age_bin(age):
+        """Convert age to age bin."""
+        if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
+            return "<UNK>"
+        try:
+            age = float(age)
+            if age < 25:
+                return "18-24"
+            elif age < 35:
+                return "25-34"
+            elif age < 45:
+                return "35-44"
+            elif age < 55:
+                return "45-54"
+            else:
+                return "55+"
+        except (ValueError, TypeError):
+            return "<UNK>"
+
+    def __init__(self, data_path: str, annot_meta_path: str, max_length: int = 512, 
                  dataset_type: str = "varierrnli", task_type: str = "soft_label",
-                 metadata_path: Optional[str] = None):
+                 tokenizer=None):
         self.max_length = max_length
         self.dataset_type = dataset_type
         self.task_type = task_type
+        self.tokenizer = tokenizer
         self.data = self.load_data(data_path)
-        self.demographics_encoder = None
-        if metadata_path and os.path.exists(metadata_path):
-            self.demographics_encoder = DemographicsEncoder(metadata_path)
+        
+        # Load annotator metadata
+        with open(annot_meta_path, "r", encoding="utf-8") as f:
+            self.annot_meta = json.load(f)
+
+        self.texts = []
+        self.labels = []
+        self.dists = []
+        
+        # Initialize storage for demographic fields
+        self.demographic_ids = {field: [] for field in self.FIELD_KEYS}
+
+        self.vocab = {
+            field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
+            for field in self.FIELD_KEYS
+        }
+
+        # Build vocabulary from all annotators
+        for ann_data in self.annot_meta.values():
+            for field, json_key in self.FIELD_KEYS.items():
+                if field == "age":
+                    # Special handling for age - convert to age bin
+                    age_bin = self.get_age_bin(ann_data.get(json_key))
+                    if age_bin not in self.vocab[field]:
+                        self.vocab[field][age_bin] = len(self.vocab[field])
+                else:
+                    val = str(ann_data.get(json_key, "")).strip()
+                    if val == "":
+                        val = "<UNK>"
+                    if val not in self.vocab[field]:
+                        self.vocab[field][val] = len(self.vocab[field])
+
+        self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
+        
+        # Process data
+        self.process_data()
+        
+        print(f"Dataset created with {len(self.texts)} examples")
+        print(f"Demographic vocabulary sizes: {self.vocab_sizes}")
     
     def load_data(self, data_path: str):
         import json
@@ -128,287 +176,206 @@ class VariErrNLI_Dataset(Dataset):
             raise ValueError("Unsupported file format. Use .json.")
         return data
     
+    def process_data(self):
+        """Process the data and create examples for each annotator"""
+        if isinstance(self.data, dict):
+            data_items = list(self.data.values())
+        else:
+            data_items = self.data
+            
+        for ex in data_items:
+            context = ex['text']['context']
+            statement = ex['text']['statement']
+            text = f"{context} [SEP] {statement}"
+            
+            # Get annotator list
+            ann_str = ex.get("annotators", "")
+            ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
+            
+            if self.task_type == "soft_label":
+                # Create soft label from all annotators
+                annotator_list = [a.strip() for a in ex.get('annotators', '').split(',')]
+                annotations_dict = ex.get('annotations', {})
+                multi_hot_vectors = []
+                
+                for ann in annotator_list:
+                    if ann in annotations_dict:
+                        label_str = annotations_dict[ann]
+                        label_vec = [0, 0, 0]
+                        for label in label_str.split(','):
+                            label = label.strip()
+                            if label in NLI_LABEL2IDX:
+                                label_vec[NLI_LABEL2IDX[label]] = 1
+                        multi_hot_vectors.append(label_vec)
+                
+                if multi_hot_vectors:
+                    soft_label = torch.tensor(multi_hot_vectors, dtype=torch.float).mean(dim=0)
+                else:
+                    soft_label = torch.zeros(3, dtype=torch.float)
+                
+                # Create one example with soft label
+                self.texts.append(text)
+                self.dists.append(soft_label.numpy())
+                self.labels.append(torch.argmax(soft_label).item())
+                
+                # Use UNK demographic info for soft label task
+                for field in self.FIELD_KEYS:
+                    self.demographic_ids[field].append(self.UNK_IDX)
+                    
+            else:
+                # Perspectivist task - create separate examples for each annotator
+                annotations_dict = ex.get('annotations', {})
+                
+                for ann_tag in ann_list:
+                    ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
+                    meta = self.annot_meta.get(ann_num, {})
+                    
+                    # Get demographic info for this specific annotator
+                    annotator_demog_ids = {}
+                    for field, json_key in self.FIELD_KEYS.items():
+                        if field == "age":
+                            age_bin = self.get_age_bin(meta.get(json_key))
+                            idx = self.vocab[field].get(age_bin, self.UNK_IDX)
+                        else:
+                            val = str(meta.get(json_key, "")).strip()
+                            if val == "":
+                                val = "<UNK>"
+                            idx = self.vocab[field].get(val, self.UNK_IDX)
+                        annotator_demog_ids[field] = idx
+                    
+                    # Get label for this annotator
+                    if ann_tag in annotations_dict:
+                        label_str = annotations_dict[ann_tag]
+                        label_vec = [0, 0, 0]
+                        for label in label_str.split(','):
+                            label = label.strip()
+                            if label in NLI_LABEL2IDX:
+                                label_vec[NLI_LABEL2IDX[label]] = 1
+                        
+                        # Add this annotator's example
+                        self.texts.append(text)
+                        self.dists.append(torch.tensor(label_vec, dtype=torch.float).numpy())
+                        self.labels.append(torch.argmax(torch.tensor(label_vec)).item())
+                        
+                        # Store demographic IDs for this annotator
+                        for field in self.FIELD_KEYS:
+                            self.demographic_ids[field].append(annotator_demog_ids[field])
+                
+                # If no annotators, create one example with UNK demographic info
+                if not ann_list:
+                    self.texts.append(text)
+                    self.dists.append(torch.zeros(3, dtype=torch.float).numpy())
+                    self.labels.append(0)  # Default to contradiction
+                    
+                    # Store UNK demographic IDs
+                    for field in self.FIELD_KEYS:
+                        self.demographic_ids[field].append(self.UNK_IDX)
+    
     def __len__(self):
-        if isinstance(self.data, list):
-            return len(self.data)
-        return len(self.data)
+        return len(self.labels)
     
     def __getitem__(self, idx):
-        if isinstance(self.data, list):
-            item = self.data[idx]
+        # Tokenize text if tokenizer is available
+        if self.tokenizer is not None:
+            enc = self.tokenizer(
+                self.texts[idx],
+                max_length=self.max_length,
+                padding=False,
+                truncation=True,
+                return_tensors="pt",
+            )
+            result = {
+                "input_ids": enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "texts": self.texts[idx],  # Keep original text for SBERT
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+            }
         else:
-            item = list(self.data.values())[idx]
-        if self.dataset_type == "varierrnli":
-            return self.process_varierrnli_item(item)
-        elif self.dataset_type == "par":
-            return self.process_par_item(item)
-        else:
-            raise ValueError(f"Unknown dataset type: {self.dataset_type}")
-    
-    def process_par_item(self, item):
-        # Not used in this script
-        return {}
-    
-    def process_varierrnli_item(self, item):
-        context = item['text']['context']
-        statement = item['text']['statement']
-        text = f"{context} [SEP] {statement}"
+            result = {
+                "texts": self.texts[idx],
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+            }
         
-        if self.task_type == "soft_label":
-            annotator_list = [a.strip() for a in item['annotators'].split(',')]
-            annotations_dict = item['annotations']
-            multi_hot_vectors = []
-            for ann in annotator_list:
-                label_str = annotations_dict[ann]
-                label_vec = [0, 0, 0]
-                for label in label_str.split(','):
-                    label = label.strip()
-                    if label in NLI_LABEL2IDX:
-                        label_vec[NLI_LABEL2IDX[label]] = 1
-                multi_hot_vectors.append(label_vec)
-            if multi_hot_vectors:
-                soft_label = torch.tensor(multi_hot_vectors, dtype=torch.float).mean(dim=0)
-            else:
-                soft_label = torch.zeros(3, dtype=torch.float)
-            labels = soft_label
-            annotator_ids = []
-            demographic_embeddings = []
-        else:
-            annotator_list = [a.strip() for a in item['annotators'].split(',')]
-            annotations_dict = item['annotations']
-            annotator_labels = []
-            
-            # Create demographic embeddings for each annotator
-            demographic_embeddings = []
-            for ann in annotator_list:
-                label_str = annotations_dict[ann]
-                label_vec = [0, 0, 0]
-                for label in label_str.split(','):
-                    label = label.strip()
-                    if label in NLI_LABEL2IDX:
-                        label_vec[NLI_LABEL2IDX[label]] = 1
-                annotator_labels.append(label_vec)
-                
-                # Create demographic embedding
-                if self.demographics_encoder:
-                    dem_emb = self.demographics_encoder.encode_annotator(ann)
-                else:
-                    dem_emb = torch.zeros(128)  # Default embedding dimension
-                demographic_embeddings.append(dem_emb)
-            
-            # Truncate if too many annotators, pad if too few
-            if len(annotator_labels) > MAX_ANNOTATORS:
-                annotator_labels = annotator_labels[:MAX_ANNOTATORS]
-                demographic_embeddings = demographic_embeddings[:MAX_ANNOTATORS]
-            while len(annotator_labels) < MAX_ANNOTATORS:
-                annotator_labels.append([-100, -100, -100])
-                demographic_embeddings.append(torch.zeros(128))
-            
-            labels = torch.tensor(annotator_labels, dtype=torch.float)
-            demographic_embeddings = torch.stack(demographic_embeddings)
-            annotator_ids = torch.tensor([hash(ann) % 1000 for ann in annotator_list[:MAX_ANNOTATORS]], dtype=torch.long)
-            while len(annotator_ids) < MAX_ANNOTATORS:
-                annotator_ids = torch.cat([annotator_ids, torch.tensor([-1])])
+        # Add demographic fields dynamically
+        for field in self.FIELD_KEYS:
+            result[f"{field}_ids"] = torch.tensor(self.demographic_ids[field][idx], dtype=torch.long)
         
-        return {
-            'text': text,
-            'labels': labels,
-            'annotator_ids': annotator_ids if self.task_type == "perspectivist" else torch.tensor([]),
-            'demographic_embeddings': demographic_embeddings if self.task_type == "perspectivist" else torch.tensor([])
-        }
+        return result
 
-class RoBERTaSBertForLeWiDi(nn.Module):
-    """Enhanced model using RoBERTa-large with pre-trained SBERT and demographics"""
-    def __init__(self, sbert_model_path: str, num_classes: int, task_type: str = "soft_label",
-                 num_annotators: Optional[int] = None, embedding_dim: int = 512,
-                 use_demographics: bool = False, demographics_dim: int = 128):
-        super(RoBERTaSBertForLeWiDi, self).__init__()
-        self.task_type = task_type
-        self.num_classes = num_classes
-        self.num_annotators = num_annotators
-        self.use_demographics = use_demographics
-        self.demographics_dim = demographics_dim
-        
-        # Load pre-trained SBERT model
-        self.sbert = SentenceTransformer(sbert_model_path)
-        self.dropout = nn.Dropout(0.1)
-        
-        # Get SBERT embedding dimension
-        emb_dim = self.sbert.get_sentence_embedding_dimension()
-        if emb_dim is None:
-            raise ValueError("SBert model did not return a valid embedding dimension.")
-        emb_dim = int(emb_dim)
-        
-        # Enhanced embedding layer that can incorporate demographics
-        if use_demographics and task_type == "perspectivist":
-            self.embedding = nn.Linear(emb_dim + demographics_dim, embedding_dim)
-        else:
-            self.embedding = nn.Linear(emb_dim, embedding_dim)
-        
-        # Additional layers for better feature extraction
-        self.hidden_layer = nn.Linear(embedding_dim, embedding_dim // 2)
-        self.activation = nn.ReLU()
-        
-        if task_type == "soft_label":
-            self.classifier = nn.Linear(embedding_dim // 2, num_classes)
-        else:
-            if num_annotators is None:
-                raise ValueError("num_annotators must be provided for perspectivist task_type.")
-            if use_demographics:
-                # For demographics, we process each sample-annotator pair separately
-                self.classifier = nn.Linear(embedding_dim // 2, num_classes)
-            else:
-                # Original perspectivist logic
-                self.classifier = nn.Linear(embedding_dim // 2, num_classes * num_annotators)
-    
-    def forward(self, texts, labels=None, annotator_ids=None, demographic_embeddings=None):
-        # texts: list of strings
-        embeddings = self.sbert.encode(texts, convert_to_tensor=True)
-        
-        if self.use_demographics and self.task_type == "perspectivist" and demographic_embeddings is not None:
-            # For perspectivist with demographics, we need to handle each sample-annotator pair
-            batch_size = embeddings.shape[0]
-            num_annotators = self.num_annotators or MAX_ANNOTATORS
-            
-            # Expand text embeddings to match annotator dimension
-            # embeddings: [batch_size, emb_dim] -> [batch_size * num_annotators, emb_dim]
-            expanded_embeddings = embeddings.unsqueeze(1).expand(-1, num_annotators, -1)
-            expanded_embeddings = expanded_embeddings.reshape(-1, embeddings.shape[-1])
-            
-            # Reshape demographic embeddings: [batch_size, num_annotators, dem_dim] -> [batch_size * num_annotators, dem_dim]
-            demographic_flat = demographic_embeddings.reshape(-1, demographic_embeddings.shape[-1])
-            
-            # Concatenate text and demographic embeddings
-            embeddings = torch.cat([expanded_embeddings, demographic_flat], dim=1)
-        else:
-            # For soft_label or no demographics, use original embeddings
-            pass
-        
-        x = self.dropout(embeddings)
-        x = self.embedding(x)
-        x = self.dropout(x)
-        x = self.hidden_layer(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        logits = self.classifier(x)
-        
-        loss = None
-        if labels is not None:
-            if self.task_type == "soft_label":
-                loss = F.binary_cross_entropy_with_logits(logits, labels)
-            else:
-                # For perspectivist, handle the expanded logits properly
-                if self.use_demographics and demographic_embeddings is not None:
-                    # Logits are already [batch_size * num_annotators, num_classes]
-                    # Labels are [batch_size, num_annotators], need to flatten
-                    mask = (labels != -100)
-                    # Flatten mask to match logits shape
-                    flat_mask = mask.view(-1)
-                    # Apply mask to both logits and labels
-                    valid_logits = logits[flat_mask, :]  # Select valid logits (keep all classes)
-                    valid_labels = labels[mask].view(-1, self.num_classes)  # Select valid labels
-                    loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
-                    # Reshape logits back for output
-                    logits = logits.view(-1, self.num_annotators, self.num_classes)
-                else:
-                    # Original perspectivist logic without demographics
-                    logits = logits.view(-1, self.num_annotators, self.num_classes)
-                    mask = (labels != -100)
-                    valid_logits = logits[mask].view(-1, self.num_classes)
-                    valid_labels = labels[mask].view(-1, self.num_classes)
-                    loss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels)
-        
-        return {
-            'loss': loss,
-            'logits': logits,
-            'predictions': torch.sigmoid(logits)
-        }
+def collate_fn(batch):
+    """Handles tokenized inputs and demographic values for VariErrNLI dataset."""
+    texts = [b["texts"] for b in batch]
+    labels = torch.stack([b["labels"] for b in batch])
+    dists = torch.stack([b["dist"] for b in batch])
 
-class LeWiDiTrainer:
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.model = model
-        self.device = device
-        self.model.to(device)
+    result = {
+        "texts": texts,
+        "labels": labels,
+        "dist": dists,
+    }
+    
+    # Handle tokenized inputs if present
+    if "input_ids" in batch[0]:
+        input_ids = [b["input_ids"] for b in batch]
+        attention_mask = [b["attention_mask"] for b in batch]
         
-    def train(self, train_dataloader, val_dataloader, epochs=3, learning_rate=2e-5,
-              warmup_steps=0.1, save_path=None):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
-        total_steps = len(train_dataloader) * epochs
-        warmup_steps = int(total_steps * warmup_steps) if warmup_steps < 1 else warmup_steps
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
-        self.model.train()
-        best_val_loss = float('inf')
+        # Pad sequences
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
         
-        for epoch in range(epochs):
-            total_loss = 0
-            for batch_idx, batch in enumerate(train_dataloader):
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                annotator_ids = batch.get('annotator_ids', None)
-                demographic_embeddings = batch.get('demographic_embeddings', None)
-                if annotator_ids is not None:
-                    annotator_ids = annotator_ids.to(self.device)
-                if demographic_embeddings is not None:
-                    demographic_embeddings = demographic_embeddings.to(self.device)
-                outputs = self.model(texts, labels, annotator_ids, demographic_embeddings)
-                loss = outputs['loss']
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                total_loss += loss.item()
-                if batch_idx % 100 == 0:
-                    print(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}/{len(train_dataloader)}, '
-                          f'Loss: {loss.item():.4f}')
-            val_loss = self.evaluate(val_dataloader)
-            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {total_loss/len(train_dataloader):.4f}, '
-                  f'Val Loss: {val_loss:.4f}')
-            if save_path and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_model(save_path)
-                print(f'Model saved to {save_path}')
+        result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
+    
+    # Dynamically handle demographic fields
+    demographic_keys = [k for k in batch[0].keys() 
+                        if k.endswith("_ids") and k not in ["input_ids"]]
+    for key in demographic_keys:
+        tensors = [b[key] for b in batch]
+        stacked = torch.stack(tensors)
+        result[key] = stacked
+
+    return result
+
+def evaluate(model, dataloader, device, task_type="soft_label"):
+    """Return mean Manhattan (L1) distance between predicted and true distributions."""
+    model.eval()
+    total_dist = 0.0
+    n_examples = 0
+    all_predictions = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+            # Prepare demographic inputs dynamically (exclude texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                texts=batch["texts"],
+                **demographic_inputs
+            )
+            
+            if task_type == "soft_label":
+                p_hat = torch.sigmoid(logits)  # Use sigmoid for binary classification
+                dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
+            else:
+                p_hat = torch.softmax(logits, dim=-1)  # Use softmax for multi-class
+                dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
                 
-    def evaluate(self, dataloader):
-        self.model.eval()
-        total_loss = 0
-        with torch.no_grad():
-            for batch in dataloader:
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                annotator_ids = batch.get('annotator_ids', None)
-                demographic_embeddings = batch.get('demographic_embeddings', None)
-                if annotator_ids is not None:
-                    annotator_ids = annotator_ids.to(self.device)
-                if demographic_embeddings is not None:
-                    demographic_embeddings = demographic_embeddings.to(self.device)
-                outputs = self.model(texts, labels, annotator_ids, demographic_embeddings)
-                total_loss += outputs['loss'].item()
-        self.model.train()
-        return total_loss / len(dataloader)
-        
-    def manhattan_distance_evaluation(self, dataloader):
-        self.model.eval()
-        total_distance = 0
-        total_samples = 0
-        with torch.no_grad():
-            for batch in dataloader:
-                texts = batch['text']
-                labels = batch['labels'].to(self.device)
-                outputs = self.model(texts)
-                predictions = outputs['predictions']
-                manhattan_dist = torch.sum(torch.abs(predictions - labels), dim=1)
-                total_distance += manhattan_dist.sum().item()
-                total_samples += len(predictions)
-        self.model.train()
-        return total_distance / total_samples
-        
-    def save_model(self, path):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.model.state_dict(), os.path.join(path, 'model.pt'))
-        
-    def load_model(self, path):
-        self.model.load_state_dict(torch.load(os.path.join(path, 'model.pt')))
+            total_dist += dist.sum().item()
+            n_examples += dist.numel()
+            
+            # Store predictions and targets for analysis
+            all_predictions.extend(p_hat.cpu().numpy())
+            all_targets.extend(batch["dist"].cpu().numpy())
+    
+    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets
 
 def main():
     # Configuration
@@ -421,17 +388,15 @@ def main():
         'num_classes': 3,  # Entailment, Neutral, Contradiction
         'train_path': 'dataset/VariErrNLI/VariErrNLI_train.json',
         'val_path': 'dataset/VariErrNLI/VariErrNLI_dev.json',
-        'test_path': 'models/VariErrNLI_test.json'
+        'annot_meta_path': 'dataset/VariErrNLI/VariErrNLI_annotators_meta.json',
+        'model_name': 'roberta-large'
     }
 
-    # Pre-train SBERT model if not exists
-    sbert_path = "pretrained_sbert_roberta_large"
-    if not os.path.exists(sbert_path):
-        print("Pre-training SBERT model from RoBERTa-large...")
-        pretrainer = PreTrainedSBert("roberta-large", MAX_LENGTH)
-        pretrainer.create_sbert_model(sbert_path)
-    else:
-        print(f"Using existing pre-trained SBERT model from {sbert_path}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config['model_name'])
 
     for task_type in ['soft_label', 'perspectivist']:
         print(f"\n{'='*50}")
@@ -439,23 +404,21 @@ def main():
         print(f"{'='*50}")
 
         train_dataset = VariErrNLI_Dataset(
-            config['train_path'], MAX_LENGTH, 'varierrnli', task_type,
-            metadata_path='dataset/VariErrNLI/VariErrNLI_annotators_meta.json'
+            config['train_path'], 
+            config['annot_meta_path'],
+            MAX_LENGTH, 
+            'varierrnli', 
+            task_type,
+            tokenizer
         )
         val_dataset = VariErrNLI_Dataset(
-            config['val_path'], MAX_LENGTH, 'varierrnli', task_type,
-            metadata_path='dataset/VariErrNLI/VariErrNLI_annotators_meta.json'
+            config['val_path'], 
+            config['annot_meta_path'],
+            MAX_LENGTH, 
+            'varierrnli', 
+            task_type,
+            tokenizer
         )
-
-        def collate_fn(batch):
-            texts = [item['text'] for item in batch]
-            labels = torch.stack([item['labels'] for item in batch])
-            if task_type == "perspectivist":
-                annotator_ids = torch.stack([item['annotator_ids'] for item in batch])
-                demographic_embeddings = torch.stack([item['demographic_embeddings'] for item in batch])
-                return {'text': texts, 'labels': labels, 'annotator_ids': annotator_ids, 'demographic_embeddings': demographic_embeddings}
-            else:
-                return {'text': texts, 'labels': labels}
 
         train_dataloader = DataLoader(
             train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn
@@ -464,21 +427,109 @@ def main():
             val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
         )
 
-        num_annotators = MAX_ANNOTATORS if task_type == 'perspectivist' else None
-        model = RoBERTaSBertForLeWiDi(
-            sbert_path, config['num_classes'], task_type, num_annotators, 
-            use_demographics=task_type == 'perspectivist'
+        model = VariErrNLIDemogModel(
+            base_name=config['model_name'],
+            vocab_sizes=train_dataset.vocab_sizes,
+            dem_dim=32,
+            sbert_dim=384,
+            dropout_rate=0.3,
+            num_classes=config['num_classes'],
+            task_type=task_type
         )
-        trainer = LeWiDiTrainer(model)
+        model.to(device)
+
+        # Optimizer setup
+        no_decay = ["bias", "LayerNorm.weight"]
+        grouped_params = [
+            {"params": [p for n,p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+             "weight_decay": 0.01},
+            {"params": [p for n,p in model.named_parameters() if any(nd in n for nd in no_decay)],
+             "weight_decay": 0.0},
+        ]
+        optimizer = AdamW(grouped_params, lr=LEARNING_RATE)
+
+        total_steps = len(train_dataloader) * EPOCHS
+        warmup_steps = int(total_steps * 0.1)
+        scheduler = get_linear_schedule_with_warmup(
+                       optimizer,
+                       num_warmup_steps=warmup_steps,
+                       num_training_steps=total_steps)
+
+        best_metric = float("inf")
+        epochs_no_improve = 0
+        best_epoch = 0
         save_path = f'models/varierrnli_{task_type}_roberta_large'
-        trainer.train(
-            train_dataloader, val_dataloader, EPOCHS, LEARNING_RATE,
-            save_path=save_path
-        )
-        if task_type == 'soft_label':
-            manhattan_score = trainer.manhattan_distance_evaluation(val_dataloader)
-            print(f"Manhattan Distance Score: {manhattan_score:.4f}")
-        print(f"Model saved to {save_path}")
+        os.makedirs(save_path, exist_ok=True)
+
+        print(f"Training samples: {len(train_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}")
+        print(f"Demographic vocabulary sizes: {train_dataset.vocab_sizes}")
+        print(f"Total training steps: {total_steps}")
+        print(f"Warmup steps: {warmup_steps}")
+
+        for epoch in range(1, EPOCHS + 1):
+            model.train()
+            epoch_loss = 0.0
+            step_count = 0
+            
+            for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}/{EPOCHS}"), 1):
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                
+                # Prepare demographic inputs dynamically (exclude texts)
+                demographic_inputs = {k: v for k, v in batch.items() 
+                                    if k.endswith("_ids") and k not in ["input_ids"]}
+                
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    texts=batch["texts"],
+                    **demographic_inputs
+                )
+
+                # Use cross-entropy loss with hard labels
+                loss = F.cross_entropy(logits, batch["labels"])
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                epoch_loss += loss.item()
+                step_count += 1
+                
+                if step % 50 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    avg_loss = epoch_loss / step_count
+                    tqdm.write(f"Epoch {epoch} step {step}: loss={avg_loss:.4f}, lr={current_lr:.2e}")
+
+            # Validation
+            val_dist, predictions, targets = evaluate(model, val_dataloader, device, task_type)
+            print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
+            
+            if val_dist < best_metric:
+                best_metric = val_dist
+                best_epoch = epoch
+                epochs_no_improve = 0
+                torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
+                print(f"New best model saved to {save_path} (metric: {best_metric:.4f})")
+            else:
+                epochs_no_improve += 1
+
+            # Print epoch summary
+            print(f"\nEpoch {epoch} Summary:")
+            print(f"  Training Loss: {epoch_loss / step_count:.4f}")
+            print(f"  Validation Distance: {val_dist:.4f}")
+            print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"  Epochs without improvement: {epochs_no_improve}")
+
+            if epochs_no_improve >= 3:  # Early stopping patience
+                print(f"\nEarly stopping triggered after {epoch} epochs")
+                print(f"Best validation distance: {best_metric:.4f} at epoch {best_epoch}")
+                break
+
+        print(f"\nTraining completed for {task_type}. Best validation distance: {best_metric:.4f}")
+        print(f"Best epoch: {best_epoch}")
 
 def generate_submission_files():
     """Generate Codabench submission files for VariErrNLI dataset using trained models."""
@@ -497,13 +548,24 @@ def generate_submission_files():
     if isinstance(data, dict):
         data = list(data.values())
     
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('roberta-large')
+    
     # Generate Task A (Soft Label) submission
     print("Generating Task A (Soft Label) submission...")
-    soft_model_path = 'models/varierrnli_soft_label_roberta_large'
-    sbert_path = "pretrained_sbert_roberta_large"
-    model = RoBERTaSBertForLeWiDi(sbert_path, num_classes=num_bins, task_type='soft_label')
-    trainer = LeWiDiTrainer(model)
-    trainer.load_model(soft_model_path)
+    soft_model_path = 'models/varierrnli_soft_label_roberta_large/pytorch_model.bin'
+    
+    # Create model and load weights
+    model = VariErrNLIDemogModel(
+        base_name='roberta-large',
+        vocab_sizes={"age": 6, "gender": 3, "nationality": 20, "education": 10},  # Default sizes
+        dem_dim=32,
+        sbert_dim=384,
+        dropout_rate=0.3,
+        num_classes=num_bins,
+        task_type='soft_label'
+    )
+    model.load_state_dict(torch.load(soft_model_path))
     model.to(device)
     model.eval()
     
@@ -513,9 +575,33 @@ def generate_submission_files():
             context = ex['text']['context']
             statement = ex['text']['statement']
             text = f"{context} [SEP] {statement}"
+            
+            # Tokenize
+            enc = tokenizer(
+                text,
+                max_length=max_length,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+            
+            # Prepare demographic inputs (UNK for test)
+            demographic_inputs = {
+                "age_ids": torch.tensor([1]),  # UNK
+                "gender_ids": torch.tensor([1]),  # UNK
+                "nationality_ids": torch.tensor([1]),  # UNK
+                "education_ids": torch.tensor([1]),  # UNK
+            }
+            
             with torch.no_grad():
-                outputs = model([text])
-                probs = outputs['predictions'].squeeze(0).cpu()
+                logits = model(
+                    input_ids=enc["input_ids"].to(device),
+                    attention_mask=enc["attention_mask"].to(device),
+                    texts=[text],
+                    **{k: v.to(device) for k, v in demographic_inputs.items()}
+                )
+                probs = torch.sigmoid(logits).squeeze(0).cpu()
+            
             out_probs = probs.tolist()
             if len(out_probs) < num_bins:
                 pad = [0.0] * (num_bins - len(out_probs))
@@ -531,16 +617,20 @@ def generate_submission_files():
     
     # Generate Task B (Perspectivist) submission
     print("Generating Task B (Perspectivist) submission...")
-    pe_model_path = 'models/varierrnli_perspectivist_roberta_large'
-    model_pe = RoBERTaSBertForLeWiDi(sbert_path, num_classes=num_bins, task_type='perspectivist', 
-                                     num_annotators=MAX_ANNOTATORS, use_demographics=True)
-    trainer_pe = LeWiDiTrainer(model_pe)
-    trainer_pe.load_model(pe_model_path)
+    pe_model_path = 'models/varierrnli_perspectivist_roberta_large/pytorch_model.bin'
+    
+    model_pe = VariErrNLIDemogModel(
+        base_name='roberta-large',
+        vocab_sizes={"age": 6, "gender": 3, "nationality": 20, "education": 10},  # Default sizes
+        dem_dim=32,
+        sbert_dim=384,
+        dropout_rate=0.3,
+        num_classes=num_bins,
+        task_type='perspectivist'
+    )
+    model_pe.load_state_dict(torch.load(pe_model_path))
     model_pe.to(device)
     model_pe.eval()
-    
-    # Load demographics encoder for inference
-    demographics_encoder = DemographicsEncoder('dataset/VariErrNLI/VariErrNLI_annotators_meta.json')
     
     output_file_pe = 'VariErrNLI_test_pe_roberta.tsv'
     with open(output_file_pe, "w", encoding="utf-8") as out_f:
@@ -550,37 +640,35 @@ def generate_submission_files():
             text = f"{context} [SEP] {statement}"
             ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
             
-            # Create demographic embeddings for each annotator
-            demographic_embeddings = []
-            for ann in ann_list:
-                dem_emb = demographics_encoder.encode_annotator(ann.strip())
-                demographic_embeddings.append(dem_emb)
-            
-            # Pad to MAX_ANNOTATORS
-            while len(demographic_embeddings) < MAX_ANNOTATORS:
-                demographic_embeddings.append(torch.zeros(128))
-            
-            demographic_embeddings = torch.stack(demographic_embeddings).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                outputs = model_pe([text], demographic_embeddings=demographic_embeddings)
-                preds = outputs['predictions'].squeeze(0).cpu()  # [MAX_ANNOTATORS, num_bins]
-            
             annotator_preds = []
-            if isinstance(preds, torch.Tensor) and preds.ndim == 2:
-                n_annotators = min(len(ann_list), preds.shape[0])
-                for i in range(n_annotators):
-                    label_idx = torch.argmax(preds[i]).item()
-                    label_idx = int(label_idx)
-                    if 0 <= label_idx < len(NLI_LABELS):
-                        label = NLI_LABELS[label_idx]
-                    else:
-                        label = "UNK"
-                    annotator_preds.append(label)
-            elif isinstance(preds, torch.Tensor) and preds.ndim == 1:
-                # fallback: treat as one annotator
+            for ann in ann_list:
+                # Use UNK demographic info for test
+                demographic_inputs = {
+                    "age_ids": torch.tensor([1]),  # UNK
+                    "gender_ids": torch.tensor([1]),  # UNK
+                    "nationality_ids": torch.tensor([1]),  # UNK
+                    "education_ids": torch.tensor([1]),  # UNK
+                }
+                
+                # Tokenize
+                enc = tokenizer(
+                    text,
+                    max_length=max_length,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                
+                with torch.no_grad():
+                    logits = model_pe(
+                        input_ids=enc["input_ids"].to(device),
+                        attention_mask=enc["attention_mask"].to(device),
+                        texts=[text],
+                        **{k: v.to(device) for k, v in demographic_inputs.items()}
+                    )
+                    preds = torch.softmax(logits, dim=-1).squeeze(0).cpu()
+                
                 label_idx = torch.argmax(preds).item()
-                label_idx = int(label_idx)
                 if 0 <= label_idx < len(NLI_LABELS):
                     label = NLI_LABELS[label_idx]
                 else:
