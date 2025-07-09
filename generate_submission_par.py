@@ -358,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa model name")
     parser.add_argument("--task", choices=["A", "B"], default="A", help="Which task: A (soft) or B (perspectivist)")
     parser.add_argument("--output_tsv", type=str, default=None, help="Optional output filename")
-    parser.add_argument("--num_bins", type=int, default=7, help="Number of bins to output for task A.")
+    parser.add_argument("--num_bins", type=int, default=11, help="Number of bins to output for task A.")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
