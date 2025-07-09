@@ -25,7 +25,6 @@ class CSCDemogModel(torch.nn.Module):
 
         self.text_model = AutoModel.from_pretrained(base_name)
         
-        # Create embeddings dynamically based on vocab_sizes
         self.demographic_embeddings = torch.nn.ModuleDict()
         for field, vocab_size in vocab_sizes.items():
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
@@ -41,7 +40,6 @@ class CSCDemogModel(torch.nn.Module):
         outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0]
 
-        # Get demographic embeddings dynamically
         demographic_vectors = []
         for field, emb_layer in self.demographic_embeddings.items():
             field_key = f"{field}_ids"
@@ -49,7 +47,6 @@ class CSCDemogModel(torch.nn.Module):
                 demographic_vec = emb_layer(demographic_inputs[field_key])
                 demographic_vectors.append(demographic_vec)
 
-        # Concatenate all vectors
         if demographic_vectors:
             concat = torch.cat([pooled] + demographic_vectors, dim=-1)
         else:
@@ -102,14 +99,12 @@ class CSCDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
-        # Use all available demographic fields from CSC data
         self.active_field_keys = self.FIELD_KEYS
 
         self.texts = []
         self.labels = []
         self.dists = []
         
-        # Initialize storage for active fields only
         self.demographic_ids = {field: [] for field in self.active_field_keys}
 
         with open(annot_meta_path, "r", encoding="utf-8") as f:
@@ -132,7 +127,6 @@ class CSCDataset(Dataset):
                         self.vocab[field][age_bin] = len(self.vocab[field])
                 else:
                     val = str(ann_data.get(json_key, "")).strip()
-                    # Handle CSC-specific missing/invalid values
                     if val == "" or val in ["DATA_EXPIRED", "nan", "CONSENT_REVOKED"]:
                         val = "<UNK>"
                     if val not in self.vocab[field]:
@@ -152,7 +146,6 @@ class CSCDataset(Dataset):
             if not soft_label or soft_label == "":
                 continue
             
-            # Handle 7-class soft labels (0-6)
             dist = np.zeros(7, dtype=np.float32)
             for class_str, prob in soft_label.items():
                 class_idx = int(class_str)
@@ -169,12 +162,10 @@ class CSCDataset(Dataset):
             if not ann_list:
                 ann_list = []
 
-            # Create separate examples for each annotator
             for ann_tag in ann_list:
                 ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
                 meta = annot_meta.get(ann_num, {})
                 
-                # Get demographic info for this specific annotator
                 annotator_demog_ids = {}
                 for field, json_key in self.active_field_keys.items():
                     if field == "age":
@@ -182,28 +173,23 @@ class CSCDataset(Dataset):
                         idx = self.vocab[field].get(age_bin, self.UNK_IDX)
                     else:
                         val = str(meta.get(json_key, "")).strip()
-                        # Handle CSC-specific missing/invalid values
                         if val == "" or val in ["DATA_EXPIRED", "nan", "CONSENT_REVOKED"]:
                             val = "<UNK>"
                         idx = self.vocab[field].get(val, self.UNK_IDX)
                     annotator_demog_ids[field] = idx
 
-                # Add this annotator's example
                 self.texts.append(full_text)
                 self.dists.append(dist)
                 self.labels.append(hard_label)
                 
-                # Store single demographic IDs for this annotator
                 for field in self.active_field_keys:
                     self.demographic_ids[field].append(annotator_demog_ids[field])
 
-            # If no annotators, create one example with UNK demographic info
             if not ann_list:
                 self.texts.append(full_text)
                 self.dists.append(dist)
                 self.labels.append(hard_label)
                 
-                # Store UNK demographic IDs
                 for field in self.active_field_keys:
                     self.demographic_ids[field].append(self.UNK_IDX)
 
@@ -227,7 +213,6 @@ class CSCDataset(Dataset):
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
         }
         
-        # Add demographic fields dynamically
         for field in self.active_field_keys:
             result[f"{field}_ids"] = torch.tensor(self.demographic_ids[field][idx], dtype=torch.long)
         
@@ -252,7 +237,6 @@ def collate_fn(batch):
         "dist": dists,
     }
     
-    # Dynamically handle demographic fields
     demographic_keys = [k for k in batch[0].keys() 
                         if k.endswith("_ids") and k not in ["input_ids"]]
     for key in demographic_keys:
@@ -275,8 +259,6 @@ def build_sampler(labels):
 
 def wasserstein_distance_numpy(p, q):
     """Compute Wasserstein distance between two discrete distributions."""
-    # For discrete distributions, Wasserstein distance is the minimum cost to transform one to the other
-    # For 1D case, it's the L1 distance between CDFs
     p_cdf = np.cumsum(p)
     q_cdf = np.cumsum(q)
     return np.sum(np.abs(p_cdf - q_cdf))
@@ -294,7 +276,6 @@ def evaluate(model, dataloader, device):
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # Prepare demographic inputs dynamically
             demographic_inputs = {k: v for k, v in batch.items() 
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
@@ -305,7 +286,6 @@ def evaluate(model, dataloader, device):
             )
             p_hat = torch.softmax(logits, dim=-1)
             
-            # Calculate Wasserstein distance for each example
             for i in range(p_hat.size(0)):
                 pred_dist = p_hat[i].cpu().numpy()
                 true_dist = batch["dist"][i].cpu().numpy()
@@ -313,7 +293,6 @@ def evaluate(model, dataloader, device):
                 total_dist += w_dist
                 n_examples += 1
             
-            # Store predictions and targets for analysis
             all_predictions.extend(p_hat.cpu().numpy())
             all_targets.extend(batch["dist"].cpu().numpy())
     
@@ -325,14 +304,11 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     predictions = np.array(predictions)
     targets = np.array(targets)
     
-    # Calculate prediction statistics
     pred_means = np.mean(predictions, axis=0)
     target_means = np.mean(targets, axis=0)
     
-    # Create analysis plots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # Plot 1: Class distribution comparison
     class_labels = [f'Class {i}' for i in range(7)]
     x = np.arange(7)
     width = 0.35
@@ -347,8 +323,7 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # Plot 2: Prediction vs Target for each class
-    for class_idx in [0, 3, 6]:  # Show a few classes
+    for class_idx in [0, 3, 6]:
         axes[0, 1].scatter(targets[:, class_idx], predictions[:, class_idx], 
                           alpha=0.5, s=1, label=f'Class {class_idx}')
     axes[0, 1].plot([0, 1], [0, 1], 'r--', alpha=0.8)
@@ -541,7 +516,6 @@ def train(args):
         for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # Prepare demographic inputs dynamically
             demographic_inputs = {k: v for k, v in batch.items() 
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
@@ -552,7 +526,6 @@ def train(args):
             )
 
             p_hat = torch.softmax(logits, dim=-1)
-            # Soft cross-entropy: -sum(target_dist * log(predicted_dist))
             cross_entropy_loss = -torch.sum(batch["dist"] * torch.log(p_hat + 1e-12), dim=-1).mean()
             loss = cross_entropy_loss
 
