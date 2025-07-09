@@ -74,7 +74,7 @@ class CrossAttentionParModel(torch.nn.Module):
         self.text_proj = torch.nn.Linear(emb_dim, 768)
         
         self.cross_attention_layers = torch.nn.ModuleList([
-            CrossAttentionLayer(768, dem_dim, num_heads=12, dropout=dropout_rate)
+            CrossAttentionLayer(768, dem_dim * len(vocab_sizes), num_heads=12, dropout=dropout_rate)
             for _ in range(2)
         ])
         
