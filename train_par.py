@@ -574,8 +574,6 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_l1_loss = 0.0
-        epoch_kl_loss = 0.0
         step_count = 0
         
         for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
@@ -592,10 +590,8 @@ def train(args):
                 **demographic_inputs
             )
 
-            p_hat = torch.softmax(logits, dim=-1)
-            l1_loss = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1).mean()
-            kl_loss = F.kl_div(torch.log(p_hat + 1e-12), batch["dist"], reduction="batchmean")
-            loss = (1 - args.lambda_kl) * l1_loss + args.lambda_kl * kl_loss
+            # Use cross-entropy loss with hard labels
+            loss = F.cross_entropy(logits, batch["labels"])
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -604,16 +600,12 @@ def train(args):
             optimiser.zero_grad()
 
             epoch_loss += loss.item()
-            epoch_l1_loss += l1_loss.item()
-            epoch_kl_loss += kl_loss.item()
             step_count += 1
             
             if step % 100 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 avg_loss = epoch_loss / step_count
-                avg_l1 = epoch_l1_loss / step_count
-                avg_kl = epoch_kl_loss / step_count
-                tqdm.write(f"Epoch {epoch} step {step}: total_loss={avg_loss:.4f}, l1_loss={avg_l1:.4f}, kl_loss={avg_kl:.4f}, lr={current_lr:.2e}")
+                tqdm.write(f"Epoch {epoch} step {step}: loss={avg_loss:.4f}, lr={current_lr:.2e}")
 
         if val_loader:
             val_dist, predictions, targets = evaluate(model, val_loader, device)
@@ -713,7 +705,7 @@ def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings and demographic features on Paraphrase detection (soft labels).")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings and demographic features on Paraphrase detection using cross-entropy loss.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
     parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa model name")
@@ -723,7 +715,6 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
-    parser.add_argument("--lambda_kl", type=float, default=0.3, help="Weight for KL in mixed loss (0=L1 only)")
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
