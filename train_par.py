@@ -16,13 +16,24 @@ import matplotlib.pyplot as plt
 
 
 class ParDemogModel(torch.nn.Module):
-    """SentenceTransformer model with demographic embeddings for annotator-aware paraphrase detection."""
+    """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware paraphrase detection."""
     
-    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, dropout_rate: float = 0.3, num_classes: int = 11):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3, num_classes: int = 11):
         super().__init__()
+        from transformers import AutoModel, AutoTokenizer
         from sentence_transformers import SentenceTransformer
 
-        self.text_model = SentenceTransformer(base_name)
+        # RoBERTa-Large as the main model
+        self.roberta_model = AutoModel.from_pretrained(base_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(base_name)
+        
+        # SBERT model for additional embeddings
+        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Freeze SBERT model parameters
+        for param in self.sbert_model.parameters():
+            param.requires_grad = False
+        
         self.num_classes = num_classes
         
         # Create embeddings dynamically based on vocab_sizes
@@ -30,22 +41,27 @@ class ParDemogModel(torch.nn.Module):
         for field, vocab_size in vocab_sizes.items():
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
-        # Get embedding dimension from SBert
-        emb_dim = self.text_model.get_sentence_embedding_dimension()
-        if emb_dim is None:
-            raise ValueError("SBert model did not return a valid embedding dimension.")
-        emb_dim = int(emb_dim)
+        # Get embedding dimension from RoBERTa
+        roberta_dim = self.roberta_model.config.hidden_size  # Usually 1024 for RoBERTa-Large
+        
+        # SBERT dimension (from all-MiniLM-L6-v2)
+        self.sbert_dim = sbert_dim
         
         num_demog_fields = len(vocab_sizes)
-        total_dim = emb_dim + num_demog_fields * dem_dim
+        total_dim = roberta_dim + sbert_dim + num_demog_fields * dem_dim
         
         self.norm = torch.nn.LayerNorm(total_dim)
         self.dropout = torch.nn.Dropout(dropout_rate)
         self.classifier = torch.nn.Linear(total_dim, num_classes)
 
-    def forward(self, *, texts, **demographic_inputs):
-        # Get text embeddings
-        text_embeddings = self.text_model.encode(texts, convert_to_tensor=True)
+    def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
+        # Get RoBERTa embeddings
+        roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
+        roberta_embeddings = roberta_outputs.last_hidden_state[:, 0, :]  # [CLS] token
+        
+        # Get SBERT embeddings
+        with torch.no_grad():
+            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
         
         # Get demographic embeddings dynamically
         demographic_vectors = []
@@ -55,11 +71,9 @@ class ParDemogModel(torch.nn.Module):
                 demographic_vec = emb_layer(demographic_inputs[field_key])
                 demographic_vectors.append(demographic_vec)
 
-        # Concatenate all vectors
-        if demographic_vectors:
-            concat = torch.cat([text_embeddings] + demographic_vectors, dim=-1)
-        else:
-            concat = text_embeddings
+        # Concatenate all vectors: RoBERTa + SBERT + demographics
+        all_vectors = [roberta_embeddings, sbert_embeddings] + demographic_vectors
+        concat = torch.cat(all_vectors, dim=-1)
             
         concat = self.norm(concat)
         concat = self.dropout(concat)
@@ -117,9 +131,11 @@ class ParDataset(Dataset):
         self,
         path: str,
         annot_meta_path: str,
+        tokenizer=None,
         max_length: int = 512,
     ):
         self.max_length = max_length
+        self.tokenizer = tokenizer
         
         # Always use reduced demographics for better performance
         self.active_field_keys = self.REDUCED_FIELD_KEYS
@@ -226,11 +242,28 @@ class ParDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        result = {
-            "texts": self.texts[idx],
-            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
-            "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-        }
+        # Tokenize text if tokenizer is available
+        if self.tokenizer is not None:
+            enc = self.tokenizer(
+                self.texts[idx],
+                max_length=self.max_length,
+                padding=False,
+                truncation=True,
+                return_tensors="pt",
+            )
+            result = {
+                "input_ids": enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "texts": self.texts[idx],  # Keep original text for SBERT
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+            }
+        else:
+            result = {
+                "texts": self.texts[idx],
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+            }
         
         # Add demographic fields dynamically
         for field in self.active_field_keys:
@@ -240,7 +273,7 @@ class ParDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Handles single demographic values for paraphrase dataset."""
+    """Handles tokenized inputs and demographic values for paraphrase dataset."""
 
     texts = [b["texts"] for b in batch]
     labels = torch.stack([b["labels"] for b in batch])
@@ -251,6 +284,18 @@ def collate_fn(batch):
         "labels": labels,
         "dist": dists,
     }
+    
+    # Handle tokenized inputs if present
+    if "input_ids" in batch[0]:
+        input_ids = [b["input_ids"] for b in batch]
+        attention_mask = [b["attention_mask"] for b in batch]
+        
+        # Pad sequences
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
+        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        
+        result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
     
     # Dynamically handle demographic fields - now single values, not lists
     demographic_keys = [k for k in batch[0].keys() 
@@ -291,6 +336,8 @@ def evaluate(model, dataloader, device):
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
             logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
                 texts=batch["texts"],
                 **demographic_inputs
             )
@@ -460,8 +507,12 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_ds = ParDataset(args.train_file, args.annot_meta, args.max_length)
-    val_ds = ParDataset(args.val_file, args.annot_meta, args.max_length) if args.val_file else None
+    # Initialize tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    
+    train_ds = ParDataset(args.train_file, args.annot_meta, tokenizer, args.max_length)
+    val_ds = ParDataset(args.val_file, args.annot_meta, tokenizer, args.max_length) if args.val_file else None
 
     print(f"Training samples: {len(train_ds)}")
     if val_ds:
@@ -485,6 +536,7 @@ def train(args):
         base_name=args.model_name,
         vocab_sizes=train_ds.vocab_sizes,
         dem_dim=args.dem_dim,
+        sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
         num_classes=args.num_classes,
     )
@@ -534,6 +586,8 @@ def train(args):
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
             logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
                 texts=batch["texts"],
                 **demographic_inputs
             )
@@ -659,10 +713,10 @@ def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune SentenceTransformer on Paraphrase detection (soft labels).")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings and demographic features on Paraphrase detection (soft labels).")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
-    parser.add_argument("--model_name", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model name")
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa model name")
     parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -672,6 +726,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_kl", type=float, default=0.3, help="Weight for KL in mixed loss (0=L1 only)")
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
+    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
     parser.add_argument("--patience", type=int, default=3, help="Number of epochs without improvement for early stopping")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for learning rate scheduler")
