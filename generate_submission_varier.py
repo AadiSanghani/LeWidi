@@ -205,7 +205,6 @@ def main(args):
                 }
                 
                 # Convert to JSON string without spaces for TSV format
-                import json
                 soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
                 out_f.write(f"{ex_id}\t{soft_label_str}\n")
             else:
