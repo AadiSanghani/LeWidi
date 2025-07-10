@@ -1,5 +1,6 @@
 torch>=2.0.0
 transformers>=4.39.0
+sentence-transformers>=2.2.0
 tqdm
 scikit-learn
 numpy
