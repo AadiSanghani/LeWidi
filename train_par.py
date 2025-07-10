@@ -18,9 +18,9 @@ import matplotlib.pyplot as plt
 class ParDemogModel(torch.nn.Module):
     """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware paraphrase detection."""
     
-    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3, num_classes: int = 11):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3):
         super().__init__()
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoModel
         from sentence_transformers import SentenceTransformer
 
         # RoBERTa-Large as the main model (ensure we're using roberta-large)
@@ -28,8 +28,7 @@ class ParDemogModel(torch.nn.Module):
             print(f"Warning: Expected roberta-large but got {base_name}. Using roberta-large as base model.")
             base_name = "roberta-large"
         
-        self.roberta_model = AutoModel.from_pretrained(base_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(base_name)
+        self.text_model = AutoModel.from_pretrained(base_name)
         
         # SBERT model for additional embeddings (pretrained)
         self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -38,40 +37,35 @@ class ParDemogModel(torch.nn.Module):
         for param in self.sbert_model.parameters():
             param.requires_grad = False
         
-        self.num_classes = num_classes
-        
         # Create demographic embeddings dynamically based on vocab_sizes
         self.demographic_embeddings = torch.nn.ModuleDict()
         for field, vocab_size in vocab_sizes.items():
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
         # Get embedding dimension from RoBERTa-Large (should be 1024)
-        roberta_dim = self.roberta_model.config.hidden_size
-        print(f"RoBERTa-Large hidden size: {roberta_dim}")
-        
-        # SBERT dimension (from all-MiniLM-L6-v2)
-        self.sbert_dim = sbert_dim
+        hidden_size = self.text_model.config.hidden_size
+        print(f"RoBERTa-Large hidden size: {hidden_size}")
         print(f"SBERT embedding dimension: {sbert_dim}")
         
         num_demog_fields = len(vocab_sizes)
-        total_dim = roberta_dim + sbert_dim + num_demog_fields * dem_dim
-        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {roberta_dim} + SBERT: {sbert_dim} + Demographics: {num_demog_fields * dem_dim})")
+        total_dim = hidden_size + sbert_dim + num_demog_fields * dem_dim
+        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {hidden_size} + SBERT: {sbert_dim} + Demographics: {num_demog_fields * dem_dim})")
         
         # Layer normalization and dropout for regularization
         self.norm = torch.nn.LayerNorm(total_dim)
         self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(total_dim, num_classes)
+        self.classifier = torch.nn.Linear(total_dim, 11)  # Likert scale -5 to +5 (11 classes)
 
     def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
         # Get RoBERTa embeddings from the main model
-        roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
-        roberta_embeddings = roberta_outputs.last_hidden_state[:, 0, :]  # [CLS] token
+        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state[:, 0]  # [CLS] token
         
         # Get SBERT embeddings (frozen pretrained model)
         with torch.no_grad():
             sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
             # Ensure SBERT embeddings are on the same device as RoBERTa embeddings
-            sbert_embeddings = sbert_embeddings.to(roberta_embeddings.device)
+            sbert_embeddings = sbert_embeddings.to(pooled.device)
         
         # Get demographic embeddings dynamically
         demographic_vectors = []
@@ -82,7 +76,7 @@ class ParDemogModel(torch.nn.Module):
                 demographic_vectors.append(demographic_vec)
 
         # Concatenate all vectors: RoBERTa + SBERT + demographics
-        all_vectors = [roberta_embeddings, sbert_embeddings] + demographic_vectors
+        all_vectors = [pooled, sbert_embeddings] + demographic_vectors
         concat = torch.cat(all_vectors, dim=-1)
             
         # Apply layer normalization and dropout for regularization
@@ -107,6 +101,7 @@ class ParDataset(Dataset):
         "nationality": "Nationality",
         "student": "Student status",
         "employment": "Employment status",
+        "education": "Education",
     }
 
     # Reduced field set for better performance
@@ -123,29 +118,23 @@ class ParDataset(Dataset):
         if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
             return "<UNK>"
         try:
-            age = float(age)
-            if age < 25:
+            age_int = int(age)
+            if age_int < 25:
                 return "18-24"
-            elif age < 35:
+            elif age_int < 35:
                 return "25-34"
-            elif age < 45:
+            elif age_int < 45:
                 return "35-44"
-            elif age < 55:
+            elif age_int < 55:
                 return "45-54"
             else:
                 return "55+"
         except (ValueError, TypeError):
             return "<UNK>"
 
-    def __init__(
-        self,
-        path: str,
-        annot_meta_path: str,
-        tokenizer=None,
-        max_length: int = 512,
-    ):
-        self.max_length = max_length
+    def __init__(self, path: str, tokenizer: AutoTokenizer, annot_meta_path: str, max_length: int = 512):
         self.tokenizer = tokenizer
+        self.max_length = max_length
         
         # Always use reduced demographics for better performance
         self.active_field_keys = self.REDUCED_FIELD_KEYS
@@ -154,21 +143,21 @@ class ParDataset(Dataset):
         self.labels = []
         self.dists = []
         
-        # Initialize storage for active fields only - now storing single values per example
+        # Initialize storage for active fields only - storing single values per example
         self.demographic_ids = {field: [] for field in self.active_field_keys}
 
+        # Load annotator metadata
         with open(annot_meta_path, "r", encoding="utf-8") as f:
-            annot_meta = json.load(f)
+            self.annot_meta = json.load(f)
 
-        self.annot_meta = annot_meta
-
+        # Build vocabularies for demographic fields
         self.vocab = {
             field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
             for field in self.active_field_keys
         }
 
         # Build vocabulary from all annotators
-        for ann_data in annot_meta.values():
+        for ann_data in self.annot_meta.values():
             for field, json_key in self.active_field_keys.items():
                 if field == "age":
                     # Special handling for age - convert to age bin
@@ -183,36 +172,52 @@ class ParDataset(Dataset):
                         self.vocab[field][val] = len(self.vocab[field])
 
         self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
-        
+
+        # Load data
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        for ex in data.values():
-            question1 = ex["text"].get("Question1", "")
-            question2 = ex["text"].get("Question2", "")
-            full_text = f"{question1} [SEP] {question2}".strip()
+        for ex_id, ex in data.items():
+            # Build input text for paraphrase: question1 + [SEP] + question2
+            question1 = ex["text"]["Question1"]
+            question2 = ex["text"]["Question2"]
+            full_text = f"{question1} {tokenizer.sep_token} {question2}".strip()
 
-            soft_label = ex.get("soft_label", {})
-            if not soft_label or soft_label == "":
-                continue
+            # Create soft distribution from annotations (Likert scale -5 to +5)
+            annotators = ex.get("annotators", "").split(",")
+            annotations = ex.get("annotations", {})
             
-            # Convert to 11-class distribution (-5 to 5)
-            soft_label_list = [float(soft_label.get(str(i), 0.0)) for i in range(-5, 6)]
-            dist = np.array(soft_label_list, dtype=np.float32)
-            if dist.sum() == 0:
-                continue
+            # Create soft distribution from ratings
+            rating_counts = Counter()
+            for annotator in annotators:
+                annotator = annotator.strip()
+                if annotator in annotations:
+                    rating = annotations[annotator]
+                    if isinstance(rating, (int, float, str)) and str(rating).lstrip('-').isdigit():
+                        rating_val = int(rating)
+                        if -5 <= rating_val <= 5:
+                            # Map from -5:5 to 0:10
+                            mapped_rating = rating_val + 5
+                            rating_counts[mapped_rating] += 1
+
+            # Create soft distribution
+            total_annotations = sum(rating_counts.values())
+            if total_annotations > 0:
+                dist = np.array([0.0] * 11, dtype=np.float32)  # 11 classes for -5 to +5
+                for rating, count in rating_counts.items():
+                    dist[rating] = count / total_annotations
+            else:
+                dist = np.array([1/11] * 11, dtype=np.float32)  # Uniform if no valid annotations
+
             dist /= dist.sum()
             hard_label = int(np.argmax(dist))
 
-            ann_str = ex.get("annotators", "")
-            ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
-            if not ann_list:
-                ann_list = []
+            ann_list = [a.strip() for a in annotators if a.strip()] if annotators else []
 
             # Create separate examples for each annotator
             for ann_tag in ann_list:
-                ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
-                meta = annot_meta.get(ann_num, {})
+                ann_num = ann_tag  # Paraphrase uses Ann1, Ann2, etc. directly
+                meta = self.annot_meta.get(ann_num, {})
                 
                 # Get demographic info for this specific annotator
                 annotator_demog_ids = {}
@@ -252,28 +257,20 @@ class ParDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        # Tokenize text if tokenizer is available
-        if self.tokenizer is not None:
-            enc = self.tokenizer(
-                self.texts[idx],
-                max_length=self.max_length,
-                padding=False,
-                truncation=True,
-                return_tensors="pt",
-            )
-            result = {
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
-                "texts": self.texts[idx],  # Keep original text for SBERT
-                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
-                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-            }
-        else:
-            result = {
-                "texts": self.texts[idx],
-                "labels": torch.tensor(self.labels[idx], dtype=torch.long),
-                "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-            }
+        enc = self.tokenizer(
+            self.texts[idx],
+            max_length=self.max_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        result = {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "texts": self.texts[idx],  # Keep original text for SBERT
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "dist": torch.tensor(self.dists[idx], dtype=torch.float),
+        }
         
         # Add demographic fields dynamically
         for field in self.active_field_keys:
@@ -283,29 +280,24 @@ class ParDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Handles tokenized inputs and demographic values for paraphrase dataset."""
+    """Pads text and handles single demographic values."""
 
+    input_ids = [b["input_ids"] for b in batch]
+    attn = [b["attention_mask"] for b in batch]
     texts = [b["texts"] for b in batch]
     labels = torch.stack([b["labels"] for b in batch])
     dists = torch.stack([b["dist"] for b in batch])
 
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
+    attn = pad_sequence(attn, batch_first=True, padding_value=0)
+
     result = {
+        "input_ids": input_ids,
+        "attention_mask": attn,
         "texts": texts,
         "labels": labels,
         "dist": dists,
     }
-    
-    # Handle tokenized inputs if present
-    if "input_ids" in batch[0]:
-        input_ids = [b["input_ids"] for b in batch]
-        attention_mask = [b["attention_mask"] for b in batch]
-        
-        # Pad sequences
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
-        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-        
-        result["input_ids"] = input_ids
-        result["attention_mask"] = attention_mask
     
     # Dynamically handle demographic fields - now single values, not lists
     demographic_keys = [k for k in batch[0].keys() 
@@ -341,7 +333,7 @@ def evaluate(model, dataloader, device):
         for batch in dataloader:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # Prepare demographic inputs dynamically (exclude texts)
+            # Prepare demographic inputs dynamically (exclude input_ids, attention_mask, texts)
             demographic_inputs = {k: v for k, v in batch.items() 
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
@@ -368,97 +360,215 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     predictions = np.array(predictions)
     targets = np.array(targets)
     
-    # Calculate prediction bias (for class 5, which is the highest rating)
-    pred_bias = np.mean(predictions[:, 10] - targets[:, 10])  # bias toward class 5
-    pred_std = np.std(predictions[:, 10])
-    target_std = np.std(targets[:, 10])
+    # Calculate prediction statistics
+    pred_mean = np.mean(predictions, axis=0)
+    target_mean = np.mean(targets, axis=0)
+    pred_std = np.std(predictions, axis=0)
+    target_std = np.std(targets, axis=0)
+    
+    # Calculate overall bias (weighted by class frequency)
+    overall_bias = np.sum((pred_mean - target_mean) * target_mean)
     
     # Create analysis plots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # Plot 1: Prediction vs Target scatter (for highest class)
-    axes[0, 0].scatter(targets[:, 10], predictions[:, 10], alpha=0.5, s=1)
-    axes[0, 0].plot([0, 1], [0, 1], 'r--', alpha=0.8)
-    axes[0, 0].set_xlabel('True P(rating=5)')
-    axes[0, 0].set_ylabel('Predicted P(rating=5)')
-    axes[0, 0].set_title(f'Epoch {epoch}: Prediction vs Target')
+    # Plot 1: Class distribution comparison
+    class_names = [str(i-5) for i in range(11)]  # -5 to +5
+    
+    x = np.arange(len(class_names))
+    width = 0.35
+    
+    axes[0, 0].bar(x - width/2, pred_mean, width, label='Predictions', alpha=0.7)
+    axes[0, 0].bar(x + width/2, target_mean, width, label='Targets', alpha=0.7)
+    axes[0, 0].set_xlabel('Likert Scale Rating')
+    axes[0, 0].set_ylabel('Mean Probability')
+    axes[0, 0].set_title(f'Epoch {epoch}: Class Distribution Comparison')
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(class_names)
+    axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # Plot 2: Prediction distribution
-    axes[0, 1].hist(predictions[:, 10], bins=50, alpha=0.7, label='Predictions')
-    axes[0, 1].hist(targets[:, 10], bins=50, alpha=0.7, label='Targets')
-    axes[0, 1].set_xlabel('P(rating=5)')
-    axes[0, 1].set_ylabel('Count')
-    axes[0, 1].set_title(f'Epoch {epoch}: Distribution Comparison')
-    axes[0, 1].legend()
+    # Plot 2: Prediction vs Target scatter for most frequent class
+    most_frequent_class = np.argmax(target_mean)
+    axes[0, 1].scatter(targets[:, most_frequent_class], predictions[:, most_frequent_class], alpha=0.5, s=1)
+    axes[0, 1].plot([0, 1], [0, 1], 'r--', alpha=0.8)
+    axes[0, 1].set_xlabel(f'True P(rating={most_frequent_class-5})')
+    axes[0, 1].set_ylabel(f'Predicted P(rating={most_frequent_class-5})')
+    axes[0, 1].set_title(f'Epoch {epoch}: Most Frequent Class Prediction vs Target')
     axes[0, 1].grid(True, alpha=0.3)
     
     # Plot 3: Error distribution
-    errors = predictions[:, 10] - targets[:, 10]
-    axes[1, 0].hist(errors, bins=50, alpha=0.7)
+    errors = predictions - targets
+    mean_abs_error = np.mean(np.abs(errors))
+    axes[1, 0].hist(errors.flatten(), bins=50, alpha=0.7)
     axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.8)
     axes[1, 0].set_xlabel('Prediction Error')
     axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (bias={pred_bias:.3f})')
+    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (MAE={mean_abs_error:.3f})')
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Plot 4: Error vs Target
-    axes[1, 1].scatter(targets[:, 10], errors, alpha=0.5, s=1)
-    axes[1, 1].axhline(0, color='red', linestyle='--', alpha=0.8)
-    axes[1, 1].set_xlabel('True P(rating=5)')
-    axes[1, 1].set_ylabel('Prediction Error')
-    axes[1, 1].set_title(f'Epoch {epoch}: Error vs Target')
+    # Plot 4: Predicted vs actual rating distribution (argmax)
+    pred_labels = np.argmax(predictions, axis=1) - 5  # Convert back to -5:5 scale
+    true_labels = np.argmax(targets, axis=1) - 5
+    
+    rating_range = range(-5, 6)
+    pred_counts = [np.sum(pred_labels == r) for r in rating_range]
+    true_counts = [np.sum(true_labels == r) for r in rating_range]
+    
+    x = np.arange(len(rating_range))
+    axes[1, 1].bar(x - width/2, pred_counts, width, label='Predicted', alpha=0.7)
+    axes[1, 1].bar(x + width/2, true_counts, width, label='True', alpha=0.7)
+    axes[1, 1].set_xlabel('Rating (Likert Scale)')
+    axes[1, 1].set_ylabel('Count')
+    axes[1, 1].set_title(f'Epoch {epoch}: Predicted vs True Rating Counts')
+    axes[1, 1].set_xticks(x)
+    axes[1, 1].set_xticklabels([str(r) for r in rating_range])
+    axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'epoch_{epoch}_analysis.png'), dpi=150, bbox_inches='tight')
     plt.close()
     
+    # Calculate accuracy (exact match)
+    accuracy = np.mean(pred_labels == true_labels)
+    
     return {
-        'pred_bias': pred_bias,
-        'pred_std': pred_std,
-        'target_std': target_std,
-        'mean_error': np.mean(np.abs(errors))
+        'overall_bias': float(overall_bias),
+        'pred_mean': pred_mean.tolist(),
+        'target_mean': target_mean.tolist(),
+        'pred_std': pred_std.tolist(),
+        'target_std': target_std.tolist(),
+        'mean_abs_error': float(mean_abs_error),
+        'accuracy': float(accuracy)
     }
 
 
-def save_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
-    """Save training metrics to JSON file."""
-    os.makedirs(output_dir, exist_ok=True)
-    
+def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Plot and save training metrics and curves."""
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Training loss vs validation distance
+    ax_comb = axes[0, 0]
+    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+    if val_dist_history:
+        ax_comb_twin = ax_comb.twinx()
+        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
+        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
+    ax_comb.set_title('Training Loss vs Validation Distance')
+    ax_comb.set_xlabel('Epoch')
+    ax_comb.set_ylabel('Training Loss', color='blue')
+    ax_comb.tick_params(axis='y', labelcolor='blue')
+    ax_comb.grid(True, alpha=0.3)
+
+    # Validation distance with best epoch marker
+    if val_dist_history:
+        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
+        axes[0, 1].set_title('Validation Manhattan Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
+        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Analysis metrics
+    if analysis_history:
+        accuracies = [a['accuracy'] for a in analysis_history]
+        biases = [a['overall_bias'] for a in analysis_history]
+        axes[1, 1].plot(epochs_range, accuracies, marker='o', label='Accuracy', color='purple')
+        ax_twin = axes[1, 1].twinx()
+        ax_twin.plot(epochs_range, biases, marker='s', label='Overall Bias', color='brown')
+        axes[1, 1].set_title('Accuracy and Bias')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy', color='purple')
+        ax_twin.set_ylabel('Overall Bias', color='brown')
+        axes[1, 1].tick_params(axis='y', labelcolor='purple')
+        ax_twin.tick_params(axis='y', labelcolor='brown')
+        axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
     # Save metrics to JSON
     metrics = {
         'train_loss': [float(x) for x in train_loss_history],
         'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
         'learning_rates': [float(x) for x in lr_history],
-        'analysis': [
-            {
-                'pred_bias': float(a['pred_bias']),
-                'pred_std': float(a['pred_std']),
-                'target_std': float(a['target_std']),
-                'mean_error': float(a['mean_error'])
-            } for a in analysis_history
-        ],
+        'analysis': analysis_history,
         'best_epoch': int(best_epoch) if val_dist_history else None,
         'best_metric': float(best_metric) if val_dist_history else None
     }
     
     with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
-    
-    print(f"Saved training metrics → {os.path.join(output_dir, 'training_metrics.json')}")
+
+
+def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
+    """Save 2-D PCA scatter plots of demographic embeddings."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get field names and their display names
+    field_display_names = {
+        "age": "Age",
+        "gender": "Gender", 
+        "nationality": "Nationality",
+        "education": "Education"
+    }
+
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            continue
+            
+        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
+        
+        emb = emb_layer.weight.detach().cpu().numpy()
+        if emb.shape[0] <= 2:
+            continue
+        emb = emb[2:]  # Skip PAD and UNK
+        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
+        if len(labels) != emb.shape[0]:
+            continue
+        
+        X = emb - emb.mean(axis=0, keepdims=True)
+        U, S, Vt = np.linalg.svd(X, full_matrices=False)
+        coords = X.dot(Vt.T[:, :2])
+
+        plt.figure(figsize=(8, 6))
+        plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
+        for i, label in enumerate(labels):
+            if i % max(1, len(labels)//30) == 0:
+                plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
+        plt.title(f"{display_name} Embeddings (PCA-2D)")
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {display_name} embedding visualisation → {fname}")
 
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Initialize tokenizer
-    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    
-    train_ds = ParDataset(args.train_file, args.annot_meta, tokenizer, args.max_length)
-    val_ds = ParDataset(args.val_file, args.annot_meta, tokenizer, args.max_length) if args.val_file else None
+    train_ds = ParDataset(args.train_file, tokenizer, args.annot_meta, args.max_length)
+    val_ds = ParDataset(args.val_file, tokenizer, args.annot_meta, args.max_length) if args.val_file else None
 
     print(f"Training samples: {len(train_ds)}")
     if val_ds:
@@ -484,9 +594,17 @@ def train(args):
         dem_dim=args.dem_dim,
         sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
-        num_classes=args.num_classes,
     )
     model.to(device)
+
+    frozen_layers = []
+    if getattr(args, "freeze_layers", 0) > 0:
+        for layer in model.text_model.encoder.layer[: args.freeze_layers]:
+            for p in layer.parameters():
+                p.requires_grad = False
+        frozen_layers = list(range(args.freeze_layers))
+        if frozen_layers:
+            print(f"Frozen transformer layers: {frozen_layers} for first {args.freeze_epochs} epoch(s)")
 
     no_decay = ["bias", "LayerNorm.weight"]
     grouped_params = [
@@ -515,11 +633,16 @@ def train(args):
     analysis_history = []
 
     print(f"Total training steps: {total_steps}")
-    print(f"Warmup steps: {warmup_steps}")
     print(f"Initial learning rate: {args.lr}")
-    print(f"Early stopping patience: {args.patience} epochs")
 
     for epoch in range(1, args.epochs + 1):
+        if frozen_layers and epoch > args.freeze_epochs:
+            for layer_idx in frozen_layers:
+                for p in model.text_model.encoder.layer[layer_idx].parameters():
+                    p.requires_grad = True
+            print(f"Unfroze layers {frozen_layers} at start of epoch {epoch}")
+            frozen_layers = []
+
         model.train()
         epoch_loss = 0.0
         step_count = 0
@@ -527,7 +650,7 @@ def train(args):
         for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # Prepare demographic inputs dynamically (exclude texts)
+            # Prepare demographic inputs dynamically (exclude input_ids, attention_mask, texts)
             demographic_inputs = {k: v for k, v in batch.items() 
                                 if k.endswith("_ids") and k not in ["input_ids"]}
             
@@ -538,11 +661,13 @@ def train(args):
                 **demographic_inputs
             )
 
-            # Use cross-entropy loss with hard labels
-            loss = F.cross_entropy(logits, batch["labels"])
+            p_hat = torch.softmax(logits, dim=-1)
+            # Soft cross-entropy: -sum(target_dist * log(predicted_dist))
+            cross_entropy_loss = -torch.sum(batch["dist"] * torch.log(p_hat + 1e-12), dim=-1).mean()
+            loss = cross_entropy_loss
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimiser.step()
             scheduler.step()
             optimiser.zero_grad()
@@ -550,10 +675,10 @@ def train(args):
             epoch_loss += loss.item()
             step_count += 1
             
-            if step % 50 == 0:
+            if step % 100 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 avg_loss = epoch_loss / step_count
-                tqdm.write(f"Epoch {epoch} step {step}: loss={avg_loss:.4f}, lr={current_lr:.2e}")
+                tqdm.write(f"Epoch {epoch} step {step}: cross_entropy_loss={avg_loss:.4f}, lr={current_lr:.2e}")
 
         if val_loader:
             val_dist, predictions, targets = evaluate(model, val_loader, device)
@@ -563,10 +688,9 @@ def train(args):
             analysis_history.append(analysis)
             
             print(f"Epoch {epoch} Analysis:")
-            print(f"  Prediction bias: {analysis['pred_bias']:.4f}")
-            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
-            print(f"  Prediction std: {analysis['pred_std']:.4f}")
-            print(f"  Target std: {analysis['target_std']:.4f}")
+            print(f"  Accuracy: {analysis['accuracy']:.4f}")
+            print(f"  Mean absolute error: {analysis['mean_abs_error']:.4f}")
+            print(f"  Overall bias: {analysis['overall_bias']:.4f}")
             
             if val_dist < best_metric:
                 best_metric = val_dist
@@ -575,31 +699,8 @@ def train(args):
                 save_path = os.path.join(args.output_dir, "best_model")
                 os.makedirs(save_path, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
-                
-                # Save training metadata and vocabulary for Codabench
-                metadata = {
-                    "best_epoch": best_epoch,
-                    "best_metric": best_metric,
-                    "training_config": {
-                        "lr": args.lr,
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "model_name": args.model_name,
-                        "patience": args.patience,
-                        "warmup_ratio": args.warmup_ratio,
-                        "dem_dim": args.dem_dim,
-                        "sbert_dim": args.sbert_dim,
-                        "dropout_rate": args.dropout_rate,
-                        "num_classes": args.num_classes
-                    },
-                    "vocabulary": train_ds.vocab,
-                    "vocab_sizes": train_ds.vocab_sizes,
-                    "active_field_keys": train_ds.active_field_keys
-                }
-                with open(os.path.join(save_path, "metadata.json"), "w") as f:
-                    json.dump(metadata, f, indent=2)
-                
-                print(f"New best model saved to {save_path} (metric: {best_metric:.4f})")
+                tokenizer.save_pretrained(save_path)
+                print(f"New best model saved to {save_path}")
             else:
                 epochs_no_improve += 1
 
@@ -608,92 +709,44 @@ def train(args):
             val_dist_history.append(val_dist)
         lr_history.append(scheduler.get_last_lr()[0])
 
-        # Print epoch summary
-        print(f"\nEpoch {epoch} Summary:")
-        print(f"  Training Loss: {epoch_loss / step_count:.4f}")
-        if val_loader:
-            print(f"  Validation Distance: {val_dist:.4f}")
-        print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
-        print(f"  Epochs without improvement: {epochs_no_improve}")
-
         if epochs_no_improve >= args.patience:
-            print(f"\nEarly stopping triggered after {epoch} epochs")
-            print(f"Best validation distance: {best_metric:.4f} at epoch {best_epoch}")
+            print(f"Early stopping at epoch {epoch}")
             break
 
     final_path = os.path.join(args.output_dir, "last_model")
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
+    tokenizer.save_pretrained(final_path)
 
-    save_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
-
-    # Generate submission files if requested
-    if args.generate_submission:
-        print("\nGenerating submission files...")
-        generate_submission_files(model, train_ds, args.output_dir, args.annot_meta, args.task)
+    visualize_demog_embeddings(model, train_ds, args.output_dir)
+    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
 
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
     if val_dist_history:
         print(f"Best epoch: {best_epoch}")
 
 
-def generate_submission_files(model, dataset: ParDataset, output_dir: str, annot_meta_path: str, task: str = "A"):
-    """Generate submission files for Codabench."""
-    import json
-    
-    # Load annotator metadata
-    with open(annot_meta_path, "r", encoding="utf-8") as f:
-        annot_meta = json.load(f)
-    
-    # Create placeholder test data (will be replaced by Codabench)
-    test_data = {}
-    
-    # Build output filenames
-    if task == "A":
-        output_file = os.path.join(output_dir, "Paraphrase_test_soft.tsv")
-    else:
-        output_file = os.path.join(output_dir, "Paraphrase_test_pe.tsv")
-    
-    # Generate submission file
-    with open(output_file, "w", encoding="utf-8") as out_f:
-        for ex_id, ex in test_data.items():
-            # This is a placeholder - in Codabench, test_data will contain actual examples
-            # For now, we'll create a dummy entry to show the format
-            if task == "A":
-                # Task A: Generate soft label distribution (11 probabilities for -5 to +5)
-                dummy_probs = [0.1] * 11  # Placeholder probabilities
-                prob_str = ",".join(f"{p:.10f}" for p in dummy_probs)
-                out_f.write(f"{ex_id}\t[{prob_str}]\n")
-            else:
-                # Task B: Generate per-annotator predictions
-                dummy_rating = 0  # Placeholder rating
-                out_f.write(f"{ex_id}\t[{dummy_rating}]\n")
-    
-    print(f"Generated submission file: {output_file}")
-    print("Note: This is a placeholder file. In Codabench, actual test data will be used.")
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with pretrained SBERT embeddings and demographic embeddings on Paraphrase detection using cross-entropy loss.")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT and demographic embeddings on Paraphrase detection using cross-entropy loss with soft labels.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
-    parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa-Large model name (recommended)")
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="HF model name")
     parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
+
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
     parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
+    parser.add_argument("--freeze_layers", type=int, default=0, help="Number of layers to freeze")
+    parser.add_argument("--freeze_epochs", type=int, default=1, help="Number of epochs to freeze layers")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
-    parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
-    parser.add_argument("--generate_submission", action="store_true", help="Generate submission files after training")
-    parser.add_argument("--task", choices=["A", "B"], default="A", help="Task for submission generation: A (soft) or B (perspectivist)")
 
     args = parser.parse_args()
-    train(args) 
+    train(args)
