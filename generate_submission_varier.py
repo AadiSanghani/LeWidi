@@ -165,8 +165,8 @@ def main(args):
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
-                # Task A: Output probability distribution for soft labels
-                # Must match the exact nested structure with STRING values (like test data)
+                # Task A: Based on competition info, VariErrNLI uses Manhattan distance like MP
+                # Try simple array format first (like CSC/MP reference)
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -176,46 +176,31 @@ def main(args):
                 elif len(out_probs) > 3:
                     out_probs = out_probs[:3]
                 
-                # Ensure probabilities sum to 1.0 exactly
-                total = sum(out_probs)
-                if total > 0:
-                    out_probs = [p / total for p in out_probs]
-                else:
-                    out_probs = [1/3, 1/3, 1/3]
+                # round to 10 decimals and fix any rounding drift
+                out_probs = [round(p, 10) for p in out_probs]
+                drift = 1.0 - sum(out_probs)
+                if abs(drift) > 1e-10:
+                    # add drift to the max prob to keep list summing to 1
+                    idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
+                    out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
                 
-                # Our model outputs: [contradiction, entailment, neutral] 
-                contradiction_prob = out_probs[0]
-                entailment_prob = out_probs[1] 
-                neutral_prob = out_probs[2]
-                
-                # Create the exact nested structure with STRING values to match test format
-                soft_label_dict = {
-                    "contradiction": {
-                        "0": str(round(1.0 - contradiction_prob, 10)),
-                        "1": str(round(contradiction_prob, 10))
-                    },
-                    "entailment": {
-                        "0": str(round(1.0 - entailment_prob, 10)),
-                        "1": str(round(entailment_prob, 10))
-                    },
-                    "neutral": {
-                        "0": str(round(1.0 - neutral_prob, 10)),
-                        "1": str(round(neutral_prob, 10))
-                    }
-                }
-                
-                # Convert to JSON string - match exact format
-                soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
-                out_f.write(f"{ex_id}\t{soft_label_str}\n")
+                # Try simple array format like CSC/MP (contradiction, entailment, neutral)
+                prob_str = ",".join(f"{p:.10f}" for p in out_probs)
+                out_f.write(f"{ex_id}\t[{prob_str}]\n")
             else:
-                # Task B: repeat predicted label for each annotator (simple baseline)
-                ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
+                # Task B: Perspectivist - predict each annotator's label
+                ann_str = ex.get("annotators", "")
+                ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
+                
                 # Convert prob distribution to single label (argmax for NLI)
                 label_idx = torch.argmax(probs).item()
                 label_names = ["contradiction", "entailment", "neutral"]
                 predicted_label = label_names[label_idx]
-                preds = ", ".join(predicted_label for _ in ann_list)
-                out_f.write(f"{ex_id}\t[{preds}]\n")
+                
+                # Output one prediction per annotator (following order in JSON)
+                preds = [predicted_label for _ in ann_list]
+                preds_str = ",".join(preds)
+                out_f.write(f"{ex_id}\t[{preds_str}]\n")
 
     print(f"Saved submission file to {args.output_tsv}")
     print("To submit: zip -j res.zip", args.output_tsv)
