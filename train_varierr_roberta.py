@@ -381,7 +381,7 @@ def main():
     # Configuration
     MAX_LENGTH = 512
     BATCH_SIZE = 8  # Reduced batch size for RoBERTa-large
-    EPOCHS = 3
+    EPOCHS = 15
     LEARNING_RATE = 1e-5  # Lower learning rate for RoBERTa-large
 
     config = {
@@ -555,17 +555,30 @@ def generate_submission_files():
     print("Generating Task A (Soft Label) submission...")
     soft_model_path = 'models/varierrnli_soft_label_roberta_large/pytorch_model.bin'
     
-    # Create model and load weights
+    # Load the saved state dict to get the actual vocabulary sizes
+    saved_state = torch.load(soft_model_path, map_location='cpu')
+    
+    # Extract vocabulary sizes from the saved model
+    vocab_sizes = {}
+    for key in saved_state.keys():
+        if key.startswith('demographic_embeddings.') and key.endswith('.weight'):
+            field = key.split('.')[1]
+            vocab_size = saved_state[key].shape[0]
+            vocab_sizes[field] = vocab_size
+    
+    print(f"Detected vocabulary sizes from saved model: {vocab_sizes}")
+    
+    # Create model with the correct vocabulary sizes
     model = VariErrNLIDemogModel(
         base_name='roberta-large',
-        vocab_sizes={"age": 6, "gender": 3, "nationality": 20, "education": 10},  # Default sizes
+        vocab_sizes=vocab_sizes,
         dem_dim=32,
         sbert_dim=384,
         dropout_rate=0.3,
         num_classes=num_bins,
         task_type='soft_label'
     )
-    model.load_state_dict(torch.load(soft_model_path))
+    model.load_state_dict(saved_state)
     model.to(device)
     model.eval()
     
@@ -586,12 +599,9 @@ def generate_submission_files():
             )
             
             # Prepare demographic inputs (UNK for test)
-            demographic_inputs = {
-                "age_ids": torch.tensor([1]),  # UNK
-                "gender_ids": torch.tensor([1]),  # UNK
-                "nationality_ids": torch.tensor([1]),  # UNK
-                "education_ids": torch.tensor([1]),  # UNK
-            }
+            demographic_inputs = {}
+            for field in vocab_sizes.keys():
+                demographic_inputs[f"{field}_ids"] = torch.tensor([1])  # UNK
             
             with torch.no_grad():
                 logits = model(
@@ -609,8 +619,14 @@ def generate_submission_files():
             out_probs = [round(p, 10) for p in out_probs]
             drift = 1.0 - sum(out_probs)
             if abs(drift) > 1e-10:
-                idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
-                out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+                # Find the index with maximum probability
+                max_idx = 0
+                max_prob = out_probs[0]
+                for i in range(1, len(out_probs)):
+                    if out_probs[i] > max_prob:
+                        max_prob = out_probs[i]
+                        max_idx = i
+                out_probs[max_idx] = round(out_probs[max_idx] + drift, 10)
             prob_str = ",".join(f"{p:.10f}" for p in out_probs)
             out_f.write(f"{idx}\t[{prob_str}]\n")
     print(f"Saved Task A submission file to {output_file}")
@@ -619,16 +635,29 @@ def generate_submission_files():
     print("Generating Task B (Perspectivist) submission...")
     pe_model_path = 'models/varierrnli_perspectivist_roberta_large/pytorch_model.bin'
     
+    # Load the saved state dict to get the actual vocabulary sizes
+    saved_state_pe = torch.load(pe_model_path, map_location='cpu')
+    
+    # Extract vocabulary sizes from the saved model
+    vocab_sizes_pe = {}
+    for key in saved_state_pe.keys():
+        if key.startswith('demographic_embeddings.') and key.endswith('.weight'):
+            field = key.split('.')[1]
+            vocab_size = saved_state_pe[key].shape[0]
+            vocab_sizes_pe[field] = vocab_size
+    
+    print(f"Detected vocabulary sizes from saved perspectivist model: {vocab_sizes_pe}")
+    
     model_pe = VariErrNLIDemogModel(
         base_name='roberta-large',
-        vocab_sizes={"age": 6, "gender": 3, "nationality": 20, "education": 10},  # Default sizes
+        vocab_sizes=vocab_sizes_pe,
         dem_dim=32,
         sbert_dim=384,
         dropout_rate=0.3,
         num_classes=num_bins,
         task_type='perspectivist'
     )
-    model_pe.load_state_dict(torch.load(pe_model_path))
+    model_pe.load_state_dict(saved_state_pe)
     model_pe.to(device)
     model_pe.eval()
     
@@ -643,12 +672,9 @@ def generate_submission_files():
             annotator_preds = []
             for ann in ann_list:
                 # Use UNK demographic info for test
-                demographic_inputs = {
-                    "age_ids": torch.tensor([1]),  # UNK
-                    "gender_ids": torch.tensor([1]),  # UNK
-                    "nationality_ids": torch.tensor([1]),  # UNK
-                    "education_ids": torch.tensor([1]),  # UNK
-                }
+                demographic_inputs = {}
+                for field in vocab_sizes_pe.keys():
+                    demographic_inputs[f"{field}_ids"] = torch.tensor([1])  # UNK
                 
                 # Tokenize
                 enc = tokenizer(
