@@ -166,8 +166,7 @@ def main(args):
 
             if args.task == "A":
                 # Task A: Output probability distribution for soft labels
-                # Must match the exact nested structure from the test JSON:
-                # {"contradiction":{"0":"","1":""},"entailment":{"0":"","1":""},"neutral":{"0":"","1":""}}
+                # Must match the exact nested structure with STRING values (like test data)
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -177,20 +176,19 @@ def main(args):
                 elif len(out_probs) > 3:
                     out_probs = out_probs[:3]
                 
-                # round to 10 decimals and fix any rounding drift
-                out_probs = [round(p, 10) for p in out_probs]
-                drift = 1.0 - sum(out_probs)
-                if abs(drift) > 1e-10:
-                    # add drift to the max prob to keep list summing to 1
-                    idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
-                    out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+                # Ensure probabilities sum to 1.0 exactly
+                total = sum(out_probs)
+                if total > 0:
+                    out_probs = [p / total for p in out_probs]
+                else:
+                    out_probs = [1/3, 1/3, 1/3]
                 
                 # Our model outputs: [contradiction, entailment, neutral] 
                 contradiction_prob = out_probs[0]
                 entailment_prob = out_probs[1] 
                 neutral_prob = out_probs[2]
                 
-                # Create the exact nested structure that matches the test JSON format
+                # Create the exact nested structure with STRING values to match test format
                 soft_label_dict = {
                     "contradiction": {
                         "0": str(round(1.0 - contradiction_prob, 10)),
@@ -201,12 +199,12 @@ def main(args):
                         "1": str(round(entailment_prob, 10))
                     },
                     "neutral": {
-                        "0": str(round(1.0 - neutral_prob, 10)), 
+                        "0": str(round(1.0 - neutral_prob, 10)),
                         "1": str(round(neutral_prob, 10))
                     }
                 }
                 
-                # Convert to JSON string without spaces for TSV format
+                # Convert to JSON string - match exact format
                 soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
                 out_f.write(f"{ex_id}\t{soft_label_str}\n")
             else:
