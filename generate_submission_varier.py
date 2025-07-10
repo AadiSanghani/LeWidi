@@ -134,8 +134,11 @@ def main(args):
 
     # Build output filename if not provided
     if args.output_tsv is None:
-        dataset_name = Path(args.test_file).stem.replace("_clear", "")
-        suffix = "_pe.tsv" if args.task == "B" else "_soft.tsv"
+        dataset_name = Path(args.test_file).stem.replace("_test_clear", "").replace("_clear", "")
+        # Ensure we get just "VariErrNLI" from "VariErrNLI_test_clear"
+        if "VariErr" in dataset_name:
+            dataset_name = "VariErrNLI"
+        suffix = "_test_pe.tsv" if args.task == "B" else "_test_soft.tsv"
         args.output_tsv = f"{dataset_name}{suffix}"
 
     with open(args.output_tsv, "w", encoding="utf-8") as out_f:
@@ -163,8 +166,8 @@ def main(args):
 
             if args.task == "A":
                 # Task A: Output probability distribution for soft labels
-                # VariErrNLI uses nested format: we need the "1" values for each class
-                # Format should be: [P(contradiction=1), P(entailment=1), P(neutral=1)]
+                # Must follow the order of soft_label field: contradiction, entailment, neutral
+                # Output the "1" values (positive probabilities) for each class
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -182,31 +185,10 @@ def main(args):
                     idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
                     out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
                 
-                # Create the nested format that VariErrNLI expects
-                # contradiction=0, entailment=1, neutral=2 in our model
-                contradiction_prob = out_probs[0]
-                entailment_prob = out_probs[1] 
-                neutral_prob = out_probs[2]
-                
-                # Format as expected by VariErrNLI: nested dictionary with "0" and "1" keys
-                soft_label_dict = {
-                    "contradiction": {
-                        "0": round(1.0 - contradiction_prob, 10),
-                        "1": round(contradiction_prob, 10)
-                    },
-                    "entailment": {
-                        "0": round(1.0 - entailment_prob, 10),
-                        "1": round(entailment_prob, 10)
-                    },
-                    "neutral": {
-                        "0": round(1.0 - neutral_prob, 10), 
-                        "1": round(neutral_prob, 10)
-                    }
-                }
-                
-                # Convert to JSON string without spaces for TSV format
-                soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
-                out_f.write(f"{ex_id}\t{soft_label_str}\n")
+                # Our model outputs: [contradiction, entailment, neutral] which matches the JSON order
+                # So we can use the probabilities directly
+                prob_str = ",".join(f"{p:.10f}" for p in out_probs)
+                out_f.write(f"{ex_id}\t[{prob_str}]\n")
             else:
                 # Task B: repeat predicted label for each annotator (simple baseline)
                 ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
