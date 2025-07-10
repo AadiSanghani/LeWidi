@@ -689,7 +689,8 @@ def train(args):
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
 
-    visualize_demog_embeddings(model, train_ds, args.output_dir)
+    if not args.no_viz:
+        visualize_demog_embeddings(model, train_ds, args.output_dir)
     plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
 
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
@@ -729,24 +730,43 @@ def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
         if len(labels) != emb.shape[0]:
             continue
         
+        # Check if we have enough data for PCA
+        if emb.shape[0] < 2 or emb.shape[1] < 2:
+            print(f"Skipping {display_name} visualization - insufficient data for PCA (shape: {emb.shape})")
+            continue
+        
         X = emb - emb.mean(axis=0, keepdims=True)
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        coords = X.dot(Vt.T[:, :2])
-
-        plt.figure(figsize=(8, 6))
-        plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
-        for i, label in enumerate(labels):
-            if i % max(1, len(labels)//30) == 0:
-                plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-        plt.title(f"{display_name} Embeddings (PCA-2D)")
-        plt.xlabel("PC1")
-        plt.ylabel("PC2")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Saved {display_name} embedding visualisation → {fname}")
+        
+        # Check if we can perform SVD
+        if X.shape[0] < 2 or X.shape[1] < 2:
+            print(f"Skipping {display_name} visualization - insufficient dimensions for SVD (shape: {X.shape})")
+            continue
+            
+        try:
+            U, S, Vt = np.linalg.svd(X, full_matrices=False)
+            # Ensure we have at least 2 components
+            if Vt.shape[0] < 2:
+                print(f"Skipping {display_name} visualization - insufficient SVD components")
+                continue
+            coords = X.dot(Vt.T[:, :2])
+            
+            plt.figure(figsize=(8, 6))
+            plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
+            for i, label in enumerate(labels):
+                if i % max(1, len(labels)//30) == 0:
+                    plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
+            plt.title(f"{display_name} Embeddings (PCA-2D)")
+            plt.xlabel("PC1")
+            plt.ylabel("PC2")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
+            plt.savefig(fname, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Saved {display_name} embedding visualisation → {fname}")
+        except Exception as e:
+            print(f"Error creating visualization for {display_name}: {e}")
+            continue
 
 
 if __name__ == "__main__":
@@ -768,6 +788,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
     parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
+    parser.add_argument("--no_viz", action="store_true", help="Skip demographic embedding visualization")
 
     args = parser.parse_args()
     train(args) 
