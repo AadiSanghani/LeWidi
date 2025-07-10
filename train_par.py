@@ -422,76 +422,10 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     }
 
 
-def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
-    """Plot and save training metrics and curves."""
-    epochs_range = list(range(1, len(train_loss_history) + 1))
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-    # Training loss vs validation distance
-    ax_comb = axes[0, 0]
-    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-    if val_dist_history:
-        ax_comb_twin = ax_comb.twinx()
-        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
-        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
-    ax_comb.set_title('Training Loss vs Validation Distance')
-    ax_comb.set_xlabel('Epoch')
-    ax_comb.set_ylabel('Training Loss', color='blue')
-    ax_comb.tick_params(axis='y', labelcolor='blue')
-    ax_comb.grid(True, alpha=0.3)
-
-    # Validation distance with best epoch marker
-    if val_dist_history:
-        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
-        axes[0, 1].set_title('Validation Manhattan Distance')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Distance')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
-        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
-
-    # Learning rate schedule
-    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
-    axes[1, 0].set_title('Learning Rate Schedule')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Learning Rate')
-    axes[1, 0].set_yscale('log')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Analysis metrics
-    if analysis_history:
-        biases = [a['pred_bias'] for a in analysis_history]
-        errors = [a['mean_error'] for a in analysis_history]
-        axes[1, 1].plot(epochs_range, biases, marker='o', label='Prediction Bias', color='purple')
-        axes[1, 1].plot(epochs_range, errors, marker='s', label='Mean Abs Error', color='brown')
-        axes[1, 1].set_title('Prediction Analysis')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Metric Value')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Separate combined plot for quick reference
-    if val_dist_history:
-        fig2, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Train Loss', color='blue')
-        ax1.tick_params(axis='y', labelcolor='blue')
-        ax2 = ax1.twinx()
-        ax2.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax2.set_ylabel('Validation Distance', color='orange')
-        ax2.tick_params(axis='y', labelcolor='orange')
-        ax1.set_title('Train Loss vs Val Distance')
-        ax1.grid(True, alpha=0.3)
-        fig2.tight_layout()
-        fig2.savefig(os.path.join(output_dir, 'loss_vs_val.png'), dpi=150, bbox_inches='tight')
-        plt.close(fig2)
-
+def save_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Save training metrics to JSON file."""
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Save metrics to JSON
     metrics = {
         'train_loss': [float(x) for x in train_loss_history],
@@ -511,6 +445,8 @@ def plot_training_metrics(train_loss_history, val_dist_history, lr_history, anal
     
     with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
+    
+    print(f"Saved training metrics → {os.path.join(output_dir, 'training_metrics.json')}")
 
 
 def train(args):
@@ -689,84 +625,52 @@ def train(args):
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
 
-    if not args.no_viz:
-        visualize_demog_embeddings(model, train_ds, args.output_dir)
-    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+    save_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+
+    # Generate submission files if requested
+    if args.generate_submission:
+        print("\nGenerating submission files...")
+        generate_submission_files(model, train_ds, args.output_dir, args.annot_meta, args.task)
 
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
     if val_dist_history:
         print(f"Best epoch: {best_epoch}")
 
 
-def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
-    """Save 2-D PCA scatter plots of demographic embeddings."""
-    import matplotlib.pyplot as plt
-    import numpy as np
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Get field names and their display names
-    field_display_names = {
-        "age": "Age",
-        "gender": "Gender", 
-        "ethnicity": "Ethnicity simplified",
-        "country_birth": "Country of birth",
-        "country_residence": "Country of residence", 
-        "nationality": "Nationality",
-        "student": "Student status",
-        "employment": "Employment status"
-    }
-
-    for field_name, emb_layer in model.demographic_embeddings.items():
-        if field_name not in dataset.vocab:
-            continue
-            
-        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
-        
-        emb = emb_layer.weight.detach().cpu().numpy()
-        if emb.shape[0] <= 2:
-            continue
-        emb = emb[2:]  # Skip PAD and UNK
-        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
-        if len(labels) != emb.shape[0]:
-            continue
-        
-        # Check if we have enough data for PCA
-        if emb.shape[0] < 2 or emb.shape[1] < 2:
-            print(f"Skipping {display_name} visualization - insufficient data for PCA (shape: {emb.shape})")
-            continue
-        
-        X = emb - emb.mean(axis=0, keepdims=True)
-        
-        # Check if we can perform SVD
-        if X.shape[0] < 2 or X.shape[1] < 2:
-            print(f"Skipping {display_name} visualization - insufficient dimensions for SVD (shape: {X.shape})")
-            continue
-            
-        try:
-            U, S, Vt = np.linalg.svd(X, full_matrices=False)
-            # Ensure we have at least 2 components
-            if Vt.shape[0] < 2:
-                print(f"Skipping {display_name} visualization - insufficient SVD components")
-                continue
-            coords = X.dot(Vt.T[:, :2])
-            
-            plt.figure(figsize=(8, 6))
-            plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
-            for i, label in enumerate(labels):
-                if i % max(1, len(labels)//30) == 0:
-                    plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-            plt.title(f"{display_name} Embeddings (PCA-2D)")
-            plt.xlabel("PC1")
-            plt.ylabel("PC2")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
-            plt.savefig(fname, dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"Saved {display_name} embedding visualisation → {fname}")
-        except Exception as e:
-            print(f"Error creating visualization for {display_name}: {e}")
-            continue
+def generate_submission_files(model, dataset: ParDataset, output_dir: str, annot_meta_path: str, task: str = "A"):
+    """Generate submission files for Codabench."""
+    import json
+    
+    # Load annotator metadata
+    with open(annot_meta_path, "r", encoding="utf-8") as f:
+        annot_meta = json.load(f)
+    
+    # Create placeholder test data (will be replaced by Codabench)
+    test_data = {}
+    
+    # Build output filenames
+    if task == "A":
+        output_file = os.path.join(output_dir, "Paraphrase_test_soft.tsv")
+    else:
+        output_file = os.path.join(output_dir, "Paraphrase_test_pe.tsv")
+    
+    # Generate submission file
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        for ex_id, ex in test_data.items():
+            # This is a placeholder - in Codabench, test_data will contain actual examples
+            # For now, we'll create a dummy entry to show the format
+            if task == "A":
+                # Task A: Generate soft label distribution (11 probabilities for -5 to +5)
+                dummy_probs = [0.1] * 11  # Placeholder probabilities
+                prob_str = ",".join(f"{p:.10f}" for p in dummy_probs)
+                out_f.write(f"{ex_id}\t[{prob_str}]\n")
+            else:
+                # Task B: Generate per-annotator predictions
+                dummy_rating = 0  # Placeholder rating
+                out_f.write(f"{ex_id}\t[{dummy_rating}]\n")
+    
+    print(f"Generated submission file: {output_file}")
+    print("Note: This is a placeholder file. In Codabench, actual test data will be used.")
 
 
 if __name__ == "__main__":
@@ -788,7 +692,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
     parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
-    parser.add_argument("--no_viz", action="store_true", help="Skip demographic embedding visualization")
+    parser.add_argument("--generate_submission", action="store_true", help="Generate submission files after training")
+    parser.add_argument("--task", choices=["A", "B"], default="A", help="Task for submission generation: A (soft) or B (perspectivist)")
 
     args = parser.parse_args()
     train(args) 
