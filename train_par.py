@@ -536,24 +536,53 @@ def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
         
         emb = emb_layer.weight.detach().cpu().numpy()
         if emb.shape[0] <= 2:
+            print(f"Skipping {display_name} - not enough embeddings (only {emb.shape[0]})")
             continue
         emb = emb[2:]  # Skip PAD and UNK
         labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
         if len(labels) != emb.shape[0]:
+            print(f"Skipping {display_name} - mismatch between labels ({len(labels)}) and embeddings ({emb.shape[0]})")
+            continue
+        
+        # Check if we have enough unique embeddings for PCA
+        if emb.shape[0] < 2:
+            print(f"Skipping {display_name} - need at least 2 unique values for visualization")
             continue
         
         X = emb - emb.mean(axis=0, keepdims=True)
         U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        coords = X.dot(Vt.T[:, :2])
-
+        
+        # Check if we can do 2D PCA
+        if Vt.shape[0] < 2:
+            print(f"Skipping {display_name} - only {Vt.shape[0]} principal component(s) available")
+            continue
+        
+        # Project to 2D (or 1D if only 1 component available)
+        n_components = min(2, Vt.shape[0], X.shape[0])
+        coords = X.dot(Vt.T[:, :n_components])
+        
         plt.figure(figsize=(8, 6))
-        plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
-        for i, label in enumerate(labels):
-            if i % max(1, len(labels)//30) == 0:
-                plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-        plt.title(f"{display_name} Embeddings (PCA-2D)")
-        plt.xlabel("PC1")
-        plt.ylabel("PC2")
+        
+        if n_components == 2:
+            # Standard 2D plot
+            plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
+            for i, label in enumerate(labels):
+                if i % max(1, len(labels)//30) == 0:
+                    plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
+            plt.xlabel("PC1")
+            plt.ylabel("PC2")
+            plt.title(f"{display_name} Embeddings (PCA-2D)")
+        else:
+            # 1D plot (project to y-axis, use indices for x-axis)
+            x_pos = np.arange(len(coords))
+            plt.scatter(x_pos, coords[:, 0], alpha=0.7, s=40)
+            for i, label in enumerate(labels):
+                if i % max(1, len(labels)//10) == 0:  # Show more labels in 1D
+                    plt.text(x_pos[i], coords[i, 0], label, fontsize=8, alpha=0.7, rotation=45)
+            plt.xlabel("Index")
+            plt.ylabel("PC1")
+            plt.title(f"{display_name} Embeddings (PCA-1D)")
+        
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
