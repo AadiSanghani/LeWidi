@@ -13,14 +13,14 @@ def get_age_bin(age):
     if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
         return "<UNK>"
     try:
-        age = float(age)
-        if age < 25:
+        age_int = int(age)
+        if age_int < 25:
             return "18-24"
-        elif age < 35:
+        elif age_int < 35:
             return "25-34"
-        elif age < 45:
+        elif age_int < 45:
             return "35-44"
-        elif age < 55:
+        elif age_int < 55:
             return "45-54"
         else:
             return "55+"
@@ -32,7 +32,7 @@ def build_input(example: dict, tokenizer: AutoTokenizer) -> str:
     """Recreate the input string exactly like during training."""
     question1 = example["text"].get("Question1", "")
     question2 = example["text"].get("Question2", "")
-    return f"{question1} [SEP] {question2}".strip()
+    return f"{question1} {tokenizer.sep_token} {question2}"
 
 
 def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
@@ -58,8 +58,7 @@ def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
     if ann_list:
         # Use first annotator's demographics
         ann_tag = ann_list[0]
-        ann_num = ann_tag[3:] if ann_tag.startswith("Ann") else ann_tag
-        meta = annot_meta.get(ann_num, {})
+        meta = annot_meta.get(ann_tag, {})
         
         demographic_ids = {}
         for field, json_key in FIELD_KEYS.items():
@@ -83,6 +82,8 @@ def process_demographic_data(example: dict, annot_meta: dict, vocab: dict):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    
     # Load annotator metadata and build vocabulary
     with open(args.annot_meta, "r", encoding="utf-8") as f:
         annot_meta = json.load(f)
@@ -117,14 +118,12 @@ def main(args):
 
     vocab_sizes = {field: len(v) for field, v in vocab.items()}
     
-    # Load the custom model
+    # Load the custom model with the base model name
     model = ParDemogModel(
-        base_name=args.model_name,
+        base_name=args.base_model_name,
         vocab_sizes=vocab_sizes,
         dem_dim=args.dem_dim,
-        sbert_dim=args.sbert_dim,
-        dropout_rate=args.dropout_rate,
-        num_classes=args.num_classes
+        sbert_dim=args.sbert_dim
     )
     
     # Load the trained weights
@@ -132,19 +131,19 @@ def main(args):
     model.to(device)
     model.eval()
 
-    # Note: Test data will be provided by Codabench during evaluation
-    # For now, we'll create a placeholder - in Codabench this will be replaced with actual test data
-    data = {}  # Placeholder - will be provided by Codabench
+    with open(args.test_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
     # Build output filename if not provided
     if args.output_tsv is None:
+        dataset_name = Path(args.test_file).stem.replace("_clear", "")
         suffix = "_pe.tsv" if args.task == "B" else "_soft.tsv"
-        args.output_tsv = f"Paraphrase_test{suffix}"
+        args.output_tsv = f"{dataset_name}{suffix}"
 
     with open(args.output_tsv, "w", encoding="utf-8") as out_f:
         for ex_id, ex in tqdm(data.items(), desc="Predicting"):
-            text = build_input(ex, model.tokenizer)
-            enc = model.tokenizer(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
+            text = build_input(ex, tokenizer)
+            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
             
             # Process demographic data
             dem_data = process_demographic_data(ex, annot_meta, vocab)
@@ -159,21 +158,21 @@ def main(args):
                 logits = model(
                     input_ids=enc["input_ids"],
                     attention_mask=enc["attention_mask"],
-                    texts=[text],
+                    texts=[text],  # SBERT needs list of texts
                     **demographic_inputs
                 )
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
                 # Task A: Output probability distribution for soft labels
-                # Paraphrase has 11 classes (-5 to +5)
+                # Paraphrase has 11 classes: probabilities for Likert scale -5 to +5
                 out_probs = probs.tolist()
-                # Ensure we output exactly num_classes probabilities
-                if len(out_probs) < args.num_classes:
-                    pad = [0.0] * (args.num_classes - len(out_probs))
+                # Ensure we output exactly 11 probabilities for Likert scale
+                if len(out_probs) < 11:
+                    pad = [0.0] * (11 - len(out_probs))
                     out_probs = pad + out_probs
-                elif len(out_probs) > args.num_classes:
-                    out_probs = out_probs[:args.num_classes]
+                elif len(out_probs) > 11:
+                    out_probs = out_probs[:11]
                 
                 # round to 10 decimals and fix any rounding drift
                 out_probs = [round(p, 10) for p in out_probs]
@@ -185,13 +184,12 @@ def main(args):
                 prob_str = ",".join(f"{p:.10f}" for p in out_probs)
                 out_f.write(f"{ex_id}\t[{prob_str}]\n")
             else:
-                # Task B: repeat predicted rating for each annotator
+                # Task B: repeat predicted rating for each annotator (simple baseline)
                 ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
-                # Convert prob distribution to single rating (argmax)
+                # Convert prob distribution to single rating (argmax + convert back to -5:5 scale)
                 rating_idx = torch.argmax(probs).item()
-                # Convert from 0-10 index to -5 to +5 rating
-                rating = rating_idx - 5
-                preds = ", ".join(str(rating) for _ in ann_list)
+                predicted_rating = rating_idx - 5  # Convert from 0:10 back to -5:5
+                preds = ", ".join(str(predicted_rating) for _ in ann_list)
                 out_f.write(f"{ex_id}\t[{preds}]\n")
 
     print(f"Saved submission file to {args.output_tsv}")
@@ -201,15 +199,14 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate submission TSV for Paraphrase dataset (Task A or B).")
     parser.add_argument("--model_dir", type=str, required=True, help="Path to fine-tuned model directory")
-    parser.add_argument("--model_name", type=str, default="roberta-large", help="Base model name (e.g., roberta-large)")
-    parser.add_argument("--annot_meta", type=str, required=True, help="Path to annotator metadata JSON")
+    parser.add_argument("--base_model_name", type=str, default="roberta-large", help="Base model name (e.g., roberta-large)")
+    parser.add_argument("--test_file", type=str, default="dataset/Paraphrase/Paraphrase_test_clear.json", help="Path to *_test_clear.json file")
+    parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--task", choices=["A", "B"], default="A", help="Which task: A (soft) or B (perspectivist)")
     parser.add_argument("--output_tsv", type=str, default=None, help="Optional output filename")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
     parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
-    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
-    parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
     args = parser.parse_args()
-    main(args) 
+    main(args)
