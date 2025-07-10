@@ -23,45 +23,55 @@ class ParDemogModel(torch.nn.Module):
         from transformers import AutoModel, AutoTokenizer
         from sentence_transformers import SentenceTransformer
 
-        # RoBERTa-Large as the main model
+        # RoBERTa-Large as the main model (ensure we're using roberta-large)
+        if "roberta-large" not in base_name.lower():
+            print(f"Warning: Expected roberta-large but got {base_name}. Using roberta-large as base model.")
+            base_name = "roberta-large"
+        
         self.roberta_model = AutoModel.from_pretrained(base_name)
         self.tokenizer = AutoTokenizer.from_pretrained(base_name)
         
-        # SBERT model for additional embeddings
+        # SBERT model for additional embeddings (pretrained)
         self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
         
-        # Freeze SBERT model parameters
+        # Freeze SBERT model parameters to use as a pretrained feature extractor
         for param in self.sbert_model.parameters():
             param.requires_grad = False
         
         self.num_classes = num_classes
         
-        # Create embeddings dynamically based on vocab_sizes
+        # Create demographic embeddings dynamically based on vocab_sizes
         self.demographic_embeddings = torch.nn.ModuleDict()
         for field, vocab_size in vocab_sizes.items():
             self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
 
-        # Get embedding dimension from RoBERTa
-        roberta_dim = self.roberta_model.config.hidden_size  # Usually 1024 for RoBERTa-Large
+        # Get embedding dimension from RoBERTa-Large (should be 1024)
+        roberta_dim = self.roberta_model.config.hidden_size
+        print(f"RoBERTa-Large hidden size: {roberta_dim}")
         
         # SBERT dimension (from all-MiniLM-L6-v2)
         self.sbert_dim = sbert_dim
+        print(f"SBERT embedding dimension: {sbert_dim}")
         
         num_demog_fields = len(vocab_sizes)
         total_dim = roberta_dim + sbert_dim + num_demog_fields * dem_dim
+        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {roberta_dim} + SBERT: {sbert_dim} + Demographics: {num_demog_fields * dem_dim})")
         
+        # Layer normalization and dropout for regularization
         self.norm = torch.nn.LayerNorm(total_dim)
         self.dropout = torch.nn.Dropout(dropout_rate)
         self.classifier = torch.nn.Linear(total_dim, num_classes)
 
     def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
-        # Get RoBERTa embeddings
+        # Get RoBERTa embeddings from the main model
         roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
         roberta_embeddings = roberta_outputs.last_hidden_state[:, 0, :]  # [CLS] token
         
-        # Get SBERT embeddings
+        # Get SBERT embeddings (frozen pretrained model)
         with torch.no_grad():
             sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
+            # Ensure SBERT embeddings are on the same device as RoBERTa embeddings
+            sbert_embeddings = sbert_embeddings.to(roberta_embeddings.device)
         
         # Get demographic embeddings dynamically
         demographic_vectors = []
@@ -75,6 +85,7 @@ class ParDemogModel(torch.nn.Module):
         all_vectors = [roberta_embeddings, sbert_embeddings] + demographic_vectors
         concat = torch.cat(all_vectors, dim=-1)
             
+        # Apply layer normalization and dropout for regularization
         concat = self.norm(concat)
         concat = self.dropout(concat)
         logits = self.classifier(concat)
@@ -629,7 +640,7 @@ def train(args):
                 os.makedirs(save_path, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
                 
-                # Save training metadata
+                # Save training metadata and vocabulary for Codabench
                 metadata = {
                     "best_epoch": best_epoch,
                     "best_metric": best_metric,
@@ -639,8 +650,15 @@ def train(args):
                         "batch_size": args.batch_size,
                         "model_name": args.model_name,
                         "patience": args.patience,
-                        "warmup_ratio": args.warmup_ratio
-                    }
+                        "warmup_ratio": args.warmup_ratio,
+                        "dem_dim": args.dem_dim,
+                        "sbert_dim": args.sbert_dim,
+                        "dropout_rate": args.dropout_rate,
+                        "num_classes": args.num_classes
+                    },
+                    "vocabulary": train_ds.vocab,
+                    "vocab_sizes": train_ds.vocab_sizes,
+                    "active_field_keys": train_ds.active_field_keys
                 }
                 with open(os.path.join(save_path, "metadata.json"), "w") as f:
                     json.dump(metadata, f, indent=2)
@@ -732,10 +750,10 @@ def visualize_demog_embeddings(model, dataset: ParDataset, output_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings and demographic features on Paraphrase detection using cross-entropy loss.")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with pretrained SBERT embeddings and demographic embeddings on Paraphrase detection using cross-entropy loss.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
-    parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa model name")
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa-Large model name (recommended)")
     parser.add_argument("--output_dir", type=str, default="runs/outputs_par")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
