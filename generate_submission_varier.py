@@ -141,7 +141,7 @@ def main(args):
         suffix = "_test_pe.tsv" if args.task == "B" else "_test_soft.tsv"
         args.output_tsv = f"{dataset_name}{suffix}"
 
-    with open(args.output_tsv, "w", encoding="utf-8") as out_f:
+    with open(args.output_tsv, "w", encoding="utf-8", newline='\n') as out_f:
         for ex_id, ex in tqdm(data.items(), desc="Predicting"):
             text = build_input(ex, tokenizer)
             enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
@@ -165,8 +165,8 @@ def main(args):
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
-                # Task A: Based on competition info, VariErrNLI uses Manhattan distance like MP
-                # Try simple array format first (like CSC/MP reference)
+                # Task A: VariErrNLI expects nested JSON with high precision floats
+                # Format: {"contradiction":{"0":float,"1":float},"entailment":{"0":float,"1":float},"neutral":{"0":float,"1":float}}
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -176,17 +176,37 @@ def main(args):
                 elif len(out_probs) > 3:
                     out_probs = out_probs[:3]
                 
-                # round to 10 decimals and fix any rounding drift
-                out_probs = [round(p, 10) for p in out_probs]
-                drift = 1.0 - sum(out_probs)
-                if abs(drift) > 1e-10:
-                    # add drift to the max prob to keep list summing to 1
-                    idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
-                    out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
+                # Ensure probabilities sum to 1.0 exactly
+                total = sum(out_probs)
+                if total > 0:
+                    out_probs = [p / total for p in out_probs]
+                else:
+                    out_probs = [1/3, 1/3, 1/3]
                 
-                # Try simple array format like CSC/MP (contradiction, entailment, neutral)
-                prob_str = ",".join(f"{p:.10f}" for p in out_probs)
-                out_f.write(f"{ex_id}\t[{prob_str}]\n")
+                # Our model outputs: [contradiction, entailment, neutral] 
+                contradiction_prob = out_probs[0]
+                entailment_prob = out_probs[1] 
+                neutral_prob = out_probs[2]
+                
+                # Create nested structure with high precision floats (like test_nested_precision.tsv)
+                soft_label_dict = {
+                    "contradiction": {
+                        "0": float(f"{1.0 - contradiction_prob:.10f}"),
+                        "1": float(f"{contradiction_prob:.10f}")
+                    },
+                    "entailment": {
+                        "0": float(f"{1.0 - entailment_prob:.10f}"),
+                        "1": float(f"{entailment_prob:.10f}")
+                    },
+                    "neutral": {
+                        "0": float(f"{1.0 - neutral_prob:.10f}"),
+                        "1": float(f"{neutral_prob:.10f}")
+                    }
+                }
+                
+                # Convert to JSON string with consistent formatting
+                soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
+                out_f.write(f"{ex_id}\t{soft_label_str}\n")
             else:
                 # Task B: Perspectivist - predict each annotator's label
                 ann_str = ex.get("annotators", "")
