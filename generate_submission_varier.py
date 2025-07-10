@@ -166,8 +166,8 @@ def main(args):
 
             if args.task == "A":
                 # Task A: Output probability distribution for soft labels
-                # Must follow the order of soft_label field: contradiction, entailment, neutral
-                # Output the "1" values (positive probabilities) for each class
+                # Must match the exact nested structure from the test JSON:
+                # {"contradiction":{"0":"","1":""},"entailment":{"0":"","1":""},"neutral":{"0":"","1":""}}
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -185,10 +185,30 @@ def main(args):
                     idx_max = max(range(len(out_probs)), key=out_probs.__getitem__)
                     out_probs[idx_max] = round(out_probs[idx_max] + drift, 10)
                 
-                # Our model outputs: [contradiction, entailment, neutral] which matches the JSON order
-                # So we can use the probabilities directly
-                prob_str = ",".join(f"{p:.10f}" for p in out_probs)
-                out_f.write(f"{ex_id}\t[{prob_str}]\n")
+                # Our model outputs: [contradiction, entailment, neutral] 
+                contradiction_prob = out_probs[0]
+                entailment_prob = out_probs[1] 
+                neutral_prob = out_probs[2]
+                
+                # Create the exact nested structure that matches the test JSON format
+                soft_label_dict = {
+                    "contradiction": {
+                        "0": str(round(1.0 - contradiction_prob, 10)),
+                        "1": str(round(contradiction_prob, 10))
+                    },
+                    "entailment": {
+                        "0": str(round(1.0 - entailment_prob, 10)),
+                        "1": str(round(entailment_prob, 10))
+                    },
+                    "neutral": {
+                        "0": str(round(1.0 - neutral_prob, 10)), 
+                        "1": str(round(neutral_prob, 10))
+                    }
+                }
+                
+                # Convert to JSON string without spaces for TSV format
+                soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
+                out_f.write(f"{ex_id}\t{soft_label_str}\n")
             else:
                 # Task B: repeat predicted label for each annotator (simple baseline)
                 ann_list = ex.get("annotators", "").split(",") if ex.get("annotators") else []
