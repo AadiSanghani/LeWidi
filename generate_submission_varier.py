@@ -165,8 +165,8 @@ def main(args):
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
-                # Task A: VariErrNLI expects nested JSON with high precision floats
-                # Format: {"contradiction":{"0":float,"1":float},"entailment":{"0":float,"1":float},"neutral":{"0":float,"1":float}}
+                # Task A: VariErrNLI expects format: [[c_0, c_1], [e_0, e_1], [n_0, n_1]]
+                # Where each pair is [P(not_class), P(class)] for contradiction, entailment, neutral
                 
                 out_probs = probs.tolist()
                 # Ensure we output exactly 3 probabilities for NLI
@@ -188,39 +188,42 @@ def main(args):
                 entailment_prob = out_probs[1] 
                 neutral_prob = out_probs[2]
                 
-                # Create nested structure with high precision floats (like test_nested_precision.tsv)
-                soft_label_dict = {
-                    "contradiction": {
-                        "0": float(f"{1.0 - contradiction_prob:.10f}"),
-                        "1": float(f"{contradiction_prob:.10f}")
-                    },
-                    "entailment": {
-                        "0": float(f"{1.0 - entailment_prob:.10f}"),
-                        "1": float(f"{entailment_prob:.10f}")
-                    },
-                    "neutral": {
-                        "0": float(f"{1.0 - neutral_prob:.10f}"),
-                        "1": float(f"{neutral_prob:.10f}")
-                    }
-                }
+                # Create the format: [[c_0, c_1], [e_0, e_1], [n_0, n_1]]
+                prediction_format = [
+                    [1.0 - contradiction_prob, contradiction_prob],  # contradiction [P(0), P(1)]
+                    [1.0 - entailment_prob, entailment_prob],        # entailment [P(0), P(1)]
+                    [1.0 - neutral_prob, neutral_prob]               # neutral [P(0), P(1)]
+                ]
                 
-                # Convert to JSON string with consistent formatting
-                soft_label_str = json.dumps(soft_label_dict, separators=(',', ':'))
-                out_f.write(f"{ex_id}\t{soft_label_str}\n")
+                # Convert to the exact string format
+                out_f.write(f"{ex_id}\t{prediction_format}\n")
             else:
-                # Task B: Perspectivist - predict each annotator's label
+                # Task B: Perspectivist - format: [[ann1_c, ann2_c, ...], [ann1_e, ann2_e, ...], [ann1_n, ann2_n, ...]]
+                # Where each inner list has predictions for each annotator for that class
+                
                 ann_str = ex.get("annotators", "")
                 ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
                 
                 # Convert prob distribution to single label (argmax for NLI)
                 label_idx = torch.argmax(probs).item()
-                label_names = ["contradiction", "entailment", "neutral"]
-                predicted_label = label_names[label_idx]
+                # label_idx: 0=contradiction, 1=entailment, 2=neutral
                 
-                # Output one prediction per annotator (following order in JSON)
-                preds = [predicted_label for _ in ann_list]
-                preds_str = ",".join(preds)
-                out_f.write(f"{ex_id}\t[{preds_str}]\n")
+                # Create predictions for each annotator for each class
+                num_annotators = len(ann_list) if ann_list else 4  # Default to 4 if no annotators
+                
+                # Initialize all predictions to 0
+                predictions = [
+                    [0] * num_annotators,  # contradiction predictions for each annotator
+                    [0] * num_annotators,  # entailment predictions for each annotator  
+                    [0] * num_annotators   # neutral predictions for each annotator
+                ]
+                
+                # Set the predicted class to 1 for all annotators
+                for i in range(num_annotators):
+                    predictions[label_idx][i] = 1
+                
+                # Convert to the exact string format
+                out_f.write(f"{ex_id}\t{predictions}\n")
 
     print(f"Saved submission file to {args.output_tsv}")
     print("To submit: zip -j res.zip", args.output_tsv)
