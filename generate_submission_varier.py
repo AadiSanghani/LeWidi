@@ -165,36 +165,65 @@ def main(args):
                 probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
             if args.task == "A":
+                # Task A: VariErrNLI expects format: [[c_0, c_1], [e_0, e_1], [n_0, n_1]]
+                # Where each pair is [P(not_class), P(class)] for contradiction, entailment, neutral
+                
                 out_probs = probs.tolist()
-                # Ensure exactly 3 probabilities
+                # Ensure we output exactly 3 probabilities for NLI
                 if len(out_probs) < 3:
                     pad = [0.0] * (3 - len(out_probs))
                     out_probs = pad + out_probs
                 elif len(out_probs) > 3:
                     out_probs = out_probs[:3]
-                # Normalize
+                
+                # Ensure probabilities sum to 1.0 exactly
                 total = sum(out_probs)
                 if total > 0:
                     out_probs = [p / total for p in out_probs]
                 else:
                     out_probs = [1/3, 1/3, 1/3]
-                # Write as a list, not nested JSON
-                prob_str = ",".join(f"{p:.10f}" for p in out_probs)
-                out_f.write(f"{ex_id}\t[{prob_str}]\n")
+                
+                # Our model outputs: [contradiction, entailment, neutral] 
+                contradiction_prob = out_probs[0]
+                entailment_prob = out_probs[1] 
+                neutral_prob = out_probs[2]
+                
+                # Create the format: [[c_0, c_1], [e_0, e_1], [n_0, n_1]]
+                prediction_format = [
+                    [1.0 - contradiction_prob, contradiction_prob],  # contradiction [P(0), P(1)]
+                    [1.0 - entailment_prob, entailment_prob],        # entailment [P(0), P(1)]
+                    [1.0 - neutral_prob, neutral_prob]               # neutral [P(0), P(1)]
+                ]
+                
+                # Convert to the exact string format
+                out_f.write(f"{ex_id}\t{prediction_format}\n")
             else:
-                # Task B: Perspectivist - predict each annotator's label
+                # Task B: Perspectivist - format: [[ann1_c, ann2_c, ...], [ann1_e, ann2_e, ...], [ann1_n, ann2_n, ...]]
+                # Where each inner list has predictions for each annotator for that class
+                
                 ann_str = ex.get("annotators", "")
                 ann_list = [a.strip() for a in ann_str.split(",") if a.strip()] if ann_str else []
                 
                 # Convert prob distribution to single label (argmax for NLI)
                 label_idx = torch.argmax(probs).item()
-                label_names = ["contradiction", "entailment", "neutral"]
-                predicted_label = label_names[label_idx]
+                # label_idx: 0=contradiction, 1=entailment, 2=neutral
                 
-                # Output one prediction per annotator (following order in JSON)
-                preds = [predicted_label for _ in ann_list]
-                preds_str = ",".join(preds)
-                out_f.write(f"{ex_id}\t[{preds_str}]\n")
+                # Create predictions for each annotator for each class
+                num_annotators = len(ann_list) if ann_list else 4  # Default to 4 if no annotators
+                
+                # Initialize all predictions to 0
+                predictions = [
+                    [0] * num_annotators,  # contradiction predictions for each annotator
+                    [0] * num_annotators,  # entailment predictions for each annotator  
+                    [0] * num_annotators   # neutral predictions for each annotator
+                ]
+                
+                # Set the predicted class to 1 for all annotators
+                for i in range(num_annotators):
+                    predictions[label_idx][i] = 1
+                
+                # Convert to the exact string format
+                out_f.write(f"{ex_id}\t{predictions}\n")
 
     print(f"Saved submission file to {args.output_tsv}")
     print("To submit: zip -j res.zip", args.output_tsv)
