@@ -14,43 +14,110 @@ from collections import Counter
 import os
 
 class MistralEvaluator:
-    def __init__(self, model_name="mistralai/Mistral-7B-Instruct-v0.2", device="auto"):
-        """Initialize Mistral-7B-Instruct-v0.2 model."""
+    def __init__(self, model_name="mistralai/Mistral-7B-Instruct-v0.2", device="auto", use_auth_token=None):
+        """Initialize Mistral model."""
         print(f"Loading {model_name}...")
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Alternative models if Mistral is not accessible
+        alternative_models = [
+            "microsoft/DialoGPT-large",
+            "microsoft/DialoGPT-medium", 
+            "facebook/opt-6.7b",
+            "EleutherAI/gpt-j-6b",
+            "bigscience/bloomz-7b1"
+        ]
         
-        # Load model with appropriate device mapping
-        if device == "auto":
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
+        try:
+            # Try to load the requested model
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, 
+                use_auth_token=use_auth_token,
                 trust_remote_code=True
             )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                trust_remote_code=True
-            ).to(device)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Load model with appropriate device mapping
+            if device == "auto":
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    use_auth_token=use_auth_token
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    use_auth_token=use_auth_token
+                ).to(device)
+            
+            self.model_name = model_name
+            
+        except Exception as e:
+            print(f"Failed to load {model_name}: {e}")
+            print("Trying alternative models...")
+            
+            # Try alternative models
+            model_loaded = False
+            for alt_model in alternative_models:
+                try:
+                    print(f"Trying {alt_model}...")
+                    self.tokenizer = AutoTokenizer.from_pretrained(alt_model)
+                    if self.tokenizer.pad_token is None:
+                        self.tokenizer.pad_token = self.tokenizer.eos_token
+                    
+                    if device == "auto":
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            alt_model,
+                            torch_dtype=torch.float16,
+                            device_map="auto"
+                        )
+                    else:
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            alt_model,
+                            torch_dtype=torch.float16
+                        ).to(device)
+                    
+                    self.model_name = alt_model
+                    model_loaded = True
+                    print(f"Successfully loaded {alt_model}")
+                    break
+                    
+                except Exception as alt_e:
+                    print(f"Failed to load {alt_model}: {alt_e}")
+                    continue
+            
+            if not model_loaded:
+                raise RuntimeError("Failed to load any suitable model")
         
         self.model.eval()
-        print(f"Model loaded successfully!")
+        print(f"Model {self.model_name} loaded successfully!")
 
     def generate_response(self, prompt, max_new_tokens=50, temperature=0.1):
-        """Generate response from Mistral model."""
-        # Format prompt with Mistral chat template
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        """Generate response from the language model."""
+        # Check if this is a Mistral model that supports chat template
+        if "mistral" in self.model_name.lower() and hasattr(self.tokenizer, 'apply_chat_template'):
+            try:
+                # Format prompt with Mistral chat template
+                messages = [{"role": "user", "content": prompt}]
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except:
+                # Fallback to regular prompt
+                formatted_prompt = prompt
+        else:
+            # For other models, use simple prompt formatting
+            formatted_prompt = f"Human: {prompt}\n\nAssistant:"
         
         inputs = self.tokenizer(
             formatted_prompt, 
             return_tensors="pt", 
-            add_special_tokens=False
+            add_special_tokens=False,
+            truncation=True,
+            max_length=2048  # Prevent overly long inputs
         ).to(self.model.device)
         
         with torch.no_grad():
@@ -60,7 +127,9 @@ class MistralEvaluator:
                 temperature=temperature,
                 do_sample=temperature > 0,
                 pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                length_penalty=1.0
             )
         
         # Extract only the generated part
@@ -295,7 +364,7 @@ def calculate_metrics(results, task_type):
             print(f"Paraphrase Correlation: {correlation:.3f}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate VariErrNLI and Paraphrase tasks with Mistral-7B-Instruct-v0.2")
+    parser = argparse.ArgumentParser(description="Evaluate VariErrNLI and Paraphrase tasks with language models")
     parser.add_argument("--data_file", type=str, required=True, help="Path to dataset JSON file")
     parser.add_argument("--task_type", choices=["nli", "paraphrase"], required=True, help="Task type")
     parser.add_argument("--output_file", type=str, required=True, help="Output results file")
@@ -303,11 +372,18 @@ def main():
     parser.add_argument("--few_shot_file", type=str, help="Training file for few-shot examples")
     parser.add_argument("--num_shots", type=int, default=3, help="Number of few-shot examples")
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
+    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", 
+                       help="Model name or path")
+    parser.add_argument("--auth_token", type=str, help="HuggingFace auth token for gated models")
     
     args = parser.parse_args()
     
     # Initialize evaluator
-    evaluator = MistralEvaluator(device=args.device)
+    evaluator = MistralEvaluator(
+        model_name=args.model_name, 
+        device=args.device,
+        use_auth_token=args.auth_token
+    )
     
     # Load few-shot examples if requested
     few_shot_examples = None
