@@ -285,7 +285,7 @@ def train(args):
                 p.requires_grad = False
         frozen_layers = list(range(args.freeze_layers))
         if frozen_layers:
-            print(f"Frozen transformer layers:import argparse
+            print(f"Frozen transformer layers:import argparse")
 import json
 import os
 import sys
