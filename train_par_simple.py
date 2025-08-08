@@ -244,10 +244,10 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     plt.close()
     
     return {
-        'pred_bias': pred_bias,
-        'pred_std': pred_std,
-        'target_std': target_std,
-        'mean_error': np.mean(np.abs(errors))
+        'pred_bias': float(pred_bias),
+        'pred_std': float(pred_std),
+        'target_std': float(target_std),
+        'mean_error': float(np.mean(np.abs(errors)))
     }
 
 
@@ -312,7 +312,14 @@ def plot_training_metrics(train_loss_history, val_dist_history, lr_history, anal
         'train_loss': [float(x) for x in train_loss_history],
         'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
         'learning_rates': [float(x) for x in lr_history],
-        'analysis': analysis_history,
+        'analysis': [
+            {
+                'pred_bias': float(a['pred_bias']),
+                'pred_std': float(a['pred_std']),
+                'target_std': float(a['target_std']),
+                'mean_error': float(a['mean_error'])
+            } for a in analysis_history
+        ],
         'best_epoch': int(best_epoch) if val_dist_history else None,
         'best_metric': float(best_metric) if val_dist_history else None
     }

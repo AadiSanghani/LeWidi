@@ -296,13 +296,13 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     accuracy = np.sum(pred_labels == true_labels) / len(true_labels)
     
     return {
-        'pred_bias_contradiction': pred_bias_contradiction,
-        'pred_bias_entailment': pred_bias_entailment,
-        'pred_bias_neutral': pred_bias_neutral,
+        'pred_bias_contradiction': float(pred_bias_contradiction),
+        'pred_bias_entailment': float(pred_bias_entailment),
+        'pred_bias_neutral': float(pred_bias_neutral),
         'pred_std': pred_std.tolist(),
         'target_std': target_std.tolist(),
-        'mean_error': np.mean(np.abs(errors)),
-        'accuracy': accuracy
+        'mean_error': float(np.mean(np.abs(errors))),
+        'accuracy': float(accuracy)
     }
 
 
@@ -367,7 +367,17 @@ def plot_training_metrics(train_loss_history, val_dist_history, lr_history, anal
         'train_loss': [float(x) for x in train_loss_history],
         'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
         'learning_rates': [float(x) for x in lr_history],
-        'analysis': analysis_history,
+        'analysis': [
+            {
+                'pred_bias_contradiction': float(a['pred_bias_contradiction']),
+                'pred_bias_entailment': float(a['pred_bias_entailment']),
+                'pred_bias_neutral': float(a['pred_bias_neutral']),
+                'pred_std': a['pred_std'],
+                'target_std': a['target_std'],
+                'mean_error': float(a['mean_error']),
+                'accuracy': float(a['accuracy'])
+            } for a in analysis_history
+        ],
         'best_epoch': int(best_epoch) if val_dist_history else None,
         'best_metric': float(best_metric) if val_dist_history else None
     }
