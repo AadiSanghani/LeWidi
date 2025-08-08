@@ -386,7 +386,7 @@ def main():
     generator = CodabenchSubmissionGenerator(
         model_path=args.model_path,
         use_mistral=args.use_mistral,
-        mistral_model_name=args.mistral_model_name,
+        mistral_model_name=args.mistral_model_name,  # ✅ This works now
         auth_token=args.auth_token
     )
     
