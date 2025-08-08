@@ -514,259 +514,80 @@ def plot_training_metrics(train_loss_history, val_dist_history, lr_history, anal
         json.dump(metrics, f, indent=2)
 
 
-def visualize_demog_embeddings(model, dataset, output_dir: str):
-    """Enhanced PCA visualization of demographic embeddings with better error handling and features."""
+def visualize_demog_embeddings(model, dataset: VariErrNLIDataset, output_dir: str):
+    """Save 2-D PCA scatter plots of demographic embeddings."""
     import matplotlib.pyplot as plt
     import numpy as np
-    import seaborn as sns
-    try:
-        from sklearn.decomposition import PCA
-        use_sklearn = True
-    except ImportError:
-        use_sklearn = False
-        print("Warning: sklearn not available, using manual PCA")
-    
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Set style for better plots
-    plt.style.use('default')
-    if 'seaborn' in sys.modules:
-        sns.set_palette("husl")
 
     # Get field names and their display names
     field_display_names = {
         "gender": "Gender", 
         "nationality": "Nationality",
-        "education": "Education",
-        "age": "Age",
-        "ethnicity": "Ethnicity",
-        "country_birth": "Country of Birth",
-        "country_residence": "Country of Residence",
-        "student": "Student Status",
-        "employment": "Employment Status"
+        "education": "Education"
     }
 
-    print("Creating PCA visualizations for demographic embeddings...")
-    
     for field_name, emb_layer in model.demographic_embeddings.items():
         if field_name not in dataset.vocab:
-            print(f"Skipping {field_name} - not found in dataset vocabulary")
             continue
             
         display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
         
-        # Get embeddings and labels
         emb = emb_layer.weight.detach().cpu().numpy()
-        all_labels = list(dataset.vocab[field_name].keys())
-        
         if emb.shape[0] <= 2:
-            print(f"Skipping {display_name} - insufficient embeddings (only {emb.shape[0]})")
+            print(f"Skipping {display_name} - not enough embeddings (only {emb.shape[0]})")
             continue
-            
-        # Skip PAD and UNK tokens
-        emb_clean = emb[2:]  # Remove PAD (index 0) and UNK (index 1)
-        labels_clean = all_labels[2:]  # Remove PAD and UNK labels
-        
-        if len(labels_clean) != emb_clean.shape[0]:
-            print(f"Skipping {display_name} - label/embedding mismatch")
+        emb = emb[2:]  # Skip PAD and UNK
+        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
+        if len(labels) != emb.shape[0]:
+            print(f"Skipping {display_name} - mismatch between labels ({len(labels)}) and embeddings ({emb.shape[0]})")
             continue
         
-        if emb_clean.shape[0] < 2:
-            print(f"Skipping {display_name} - need at least 2 categories for visualization")
+        # Check if we have enough unique embeddings for PCA
+        if emb.shape[0] < 2:
+            print(f"Skipping {display_name} - need at least 2 unique values for visualization")
             continue
         
-        # Center the embeddings
-        emb_centered = emb_clean - emb_clean.mean(axis=0)
+        X = emb - emb.mean(axis=0, keepdims=True)
+        U, S, Vt = np.linalg.svd(X, full_matrices=False)
         
-        # Use sklearn PCA if available, otherwise manual PCA
-        try:
-            # Determine number of components
-            n_samples, n_features = emb_centered.shape
-            n_components = min(2, n_features, n_samples)
-            
-            if n_components < 1:
-                print(f"Skipping {display_name} - insufficient dimensions")
-                continue
-            
-            if use_sklearn:
-                pca = PCA(n_components=n_components)
-                coords = pca.fit_transform(emb_centered)
-                explained_var = pca.explained_variance_ratio_
-            else:
-                # Manual PCA using SVD
-                U, S, Vt = np.linalg.svd(emb_centered, full_matrices=False)
-                n_components = min(n_components, Vt.shape[0])
-                coords = emb_centered.dot(Vt.T[:, :n_components])
-                # Calculate explained variance manually
-                total_var = np.sum(S**2)
-                explained_var = (S[:n_components]**2) / total_var
-            
-            # Create figure
-            fig, axes = plt.subplots(1, 2 if n_components == 2 else 1, 
-                                   figsize=(16, 6) if n_components == 2 else (10, 6))
-            if n_components == 1:
-                axes = [axes]  # Make it iterable
-            
-            # Main PCA plot
-            ax_main = axes[0]
-            
-            if n_components == 2:
-                # 2D scatter plot
-                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
-                scatter = ax_main.scatter(coords[:, 0], coords[:, 1], 
-                                        c=colors, alpha=0.8, s=100, edgecolors='black', linewidth=0.5)
-                
-                # Add labels with smart positioning to avoid overlap
-                for i, label in enumerate(labels_clean):
-                    # Only show label if it's not too crowded
-                    if i % max(1, len(labels_clean) // 15) == 0 or len(labels_clean) <= 10:
-                        ax_main.annotate(label, (coords[i, 0], coords[i, 1]), 
-                                       xytext=(5, 5), textcoords='offset points',
-                                       fontsize=9, alpha=0.8, 
-                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-                
-                ax_main.set_xlabel(f"PC1 ({explained_var[0]:.1%} variance)")
-                ax_main.set_ylabel(f"PC2 ({explained_var[1]:.1%} variance)")
-                ax_main.set_title(f"{display_name} Embeddings (PCA 2D)")
-                
-                # Variance explained plot
-                if len(axes) > 1:
-                    ax_var = axes[1]
-                    ax_var.bar(['PC1', 'PC2'], explained_var, color=['skyblue', 'lightcoral'])
-                    ax_var.set_ylabel('Explained Variance Ratio')
-                    ax_var.set_title('Variance Explained by Components')
-                    ax_var.set_ylim(0, 1)
-                    for i, v in enumerate(explained_var):
-                        ax_var.text(i, v + 0.02, f'{v:.1%}', ha='center', va='bottom')
-                        
-            else:
-                # 1D plot
-                x_pos = np.arange(len(coords))
-                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
-                ax_main.scatter(x_pos, coords[:, 0], c=colors, alpha=0.8, s=100, 
-                              edgecolors='black', linewidth=0.5)
-                
-                # Add labels
-                for i, label in enumerate(labels_clean):
-                    if i % max(1, len(labels_clean) // 10) == 0:  # Show more labels in 1D
-                        ax_main.annotate(label, (x_pos[i], coords[i, 0]), 
-                                       xytext=(0, 10), textcoords='offset points',
-                                       fontsize=9, alpha=0.8, rotation=45,
-                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-                
-                ax_main.set_xlabel("Category Index")
-                ax_main.set_ylabel(f"PC1 ({explained_var[0]:.1%} variance)")
-                ax_main.set_title(f"{display_name} Embeddings (PCA 1D)")
-                ax_main.set_xticks(x_pos[::max(1, len(x_pos)//10)])
-            
-            # Add grid and improve aesthetics
-            for ax in axes:
-                ax.grid(True, alpha=0.3)
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-            
-            plt.tight_layout()
-            
-            # Save plot
-            fname = os.path.join(output_dir, f"{field_name}_embeddings_pca.png")
-            plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
-            plt.close()
-            
-            print(f"✓ Saved {display_name} PCA visualization → {fname}")
-            print(f"  - {len(labels_clean)} categories, {n_components}D projection")
-            if n_components == 2:
-                print(f"  - Explained variance: PC1={explained_var[0]:.1%}, PC2={explained_var[1]:.1%}")
-            else:
-                print(f"  - Explained variance: PC1={explained_var[0]:.1%}")
-                
-        except Exception as e:
-            print(f"Error creating PCA plot for {display_name}: {e}")
+        # Check if we can do 2D PCA
+        if Vt.shape[0] < 2:
+            print(f"Skipping {display_name} - only {Vt.shape[0]} principal component(s) available")
             continue
-    
-    print("PCA visualization complete!")
-
-
-def create_embedding_summary_plot(model, dataset, output_dir: str):
-    """Create a summary plot showing embedding space dimensions and distributions."""
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import os
-    
-    # Collect information about all embeddings
-    embedding_info = {}
-    
-    for field_name, emb_layer in model.demographic_embeddings.items():
-        if field_name not in dataset.vocab:
-            continue
-            
-        emb = emb_layer.weight.detach().cpu().numpy()
-        vocab_size = len(dataset.vocab[field_name])
         
-        # Calculate embedding statistics
-        emb_clean = emb[2:]  # Skip PAD and UNK
-        if emb_clean.shape[0] > 0:
-            embedding_info[field_name] = {
-                'vocab_size': vocab_size - 2,  # Exclude PAD and UNK
-                'embedding_dim': emb.shape[1],
-                'mean_norm': np.mean(np.linalg.norm(emb_clean, axis=1)),
-                'std_norm': np.std(np.linalg.norm(emb_clean, axis=1)),
-                'mean_cosine_sim': np.mean([
-                    np.dot(emb_clean[i], emb_clean[j]) / 
-                    (np.linalg.norm(emb_clean[i]) * np.linalg.norm(emb_clean[j]))
-                    for i in range(len(emb_clean)) for j in range(i+1, len(emb_clean))
-                ]) if len(emb_clean) > 1 else 0
-            }
-    
-    if not embedding_info:
-        return
-    
-    # Create summary plot
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-    fields = list(embedding_info.keys())
-    field_display_names = {
-        "gender": "Gender", "nationality": "Nationality", "education": "Education",
-        "age": "Age", "ethnicity": "Ethnicity"
-    }
-    display_fields = [field_display_names.get(f, f.replace("_", " ").title()) for f in fields]
-    
-    # Plot 1: Vocabulary sizes
-    vocab_sizes = [embedding_info[f]['vocab_size'] for f in fields]
-    axes[0, 0].bar(display_fields, vocab_sizes, color='skyblue', alpha=0.7)
-    axes[0, 0].set_title('Vocabulary Sizes')
-    axes[0, 0].set_ylabel('Number of Categories')
-    axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # Plot 2: Embedding norms
-    mean_norms = [embedding_info[f]['mean_norm'] for f in fields]
-    std_norms = [embedding_info[f]['std_norm'] for f in fields]
-    axes[0, 1].bar(display_fields, mean_norms, yerr=std_norms, 
-                   color='lightcoral', alpha=0.7, capsize=5)
-    axes[0, 1].set_title('Embedding Norms (Mean ± Std)')
-    axes[0, 1].set_ylabel('L2 Norm')
-    axes[0, 1].tick_params(axis='x', rotation=45)
-    
-    # Plot 3: Cosine similarities
-    cosine_sims = [embedding_info[f]['mean_cosine_sim'] for f in fields]
-    axes[1, 0].bar(display_fields, cosine_sims, color='lightgreen', alpha=0.7)
-    axes[1, 0].set_title('Mean Pairwise Cosine Similarity')
-    axes[1, 0].set_ylabel('Cosine Similarity')
-    axes[1, 0].tick_params(axis='x', rotation=45)
-    axes[1, 0].set_ylim(-1, 1)
-    
-    # Plot 4: Embedding dimensions
-    emb_dims = [embedding_info[f]['embedding_dim'] for f in fields]
-    axes[1, 1].bar(display_fields, emb_dims, color='gold', alpha=0.7)
-    axes[1, 1].set_title('Embedding Dimensions')
-    axes[1, 1].set_ylabel('Dimension')
-    axes[1, 1].tick_params(axis='x', rotation=45)
-    
-    plt.tight_layout()
-    summary_path = os.path.join(output_dir, 'demographic_embeddings_summary.png')
-    plt.savefig(summary_path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    
-    print(f"✓ Saved embedding summary plot → {summary_path}")
+        # Project to 2D (or 1D if only 1 component available)
+        n_components = min(2, Vt.shape[0], X.shape[0])
+        coords = X.dot(Vt.T[:, :n_components])
+        
+        plt.figure(figsize=(8, 6))
+        
+        if n_components == 2:
+            # Standard 2D plot
+            plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
+            for i, label in enumerate(labels):
+                if i % max(1, len(labels)//30) == 0:
+                    plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
+            plt.xlabel("PC1")
+            plt.ylabel("PC2")
+            plt.title(f"{display_name} Embeddings (PCA-2D)")
+        else:
+            # 1D plot (project to y-axis, use indices for x-axis)
+            x_pos = np.arange(len(coords))
+            plt.scatter(x_pos, coords[:, 0], alpha=0.7, s=40)
+            for i, label in enumerate(labels):
+                if i % max(1, len(labels)//10) == 0:  # Show more labels in 1D
+                    plt.text(x_pos[i], coords[i, 0], label, fontsize=8, alpha=0.7, rotation=45)
+            plt.xlabel("Index")
+            plt.ylabel("PC1")
+            plt.title(f"{display_name} Embeddings (PCA-1D)")
+        
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {display_name} embedding visualisation → {fname}")
 
 
 def train(args):
@@ -925,10 +746,7 @@ def train(args):
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
     tokenizer.save_pretrained(final_path)
 
-    # Create visualizations
-    print("\nCreating demographic embedding visualizations...")
     visualize_demog_embeddings(model, train_ds, args.output_dir)
-    create_embedding_summary_plot(model, train_ds, args.output_dir)
     plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
 
     print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
