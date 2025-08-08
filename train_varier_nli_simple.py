@@ -16,58 +16,32 @@ import matplotlib.pyplot as plt
 
 
 class VariErrNLISimpleModel(torch.nn.Module):
-    """RoBERTa-Large model with SBERT embeddings for NLI (no demographic embeddings)."""
+    """RoBERTa-Large classifier for NLI (no SBERT, no demographics)."""
     
-    def __init__(self, base_name: str, sbert_dim: int = 384, dropout_rate: float = 0.3):
+    def __init__(self, base_name: str, dropout_rate: float = 0.3):
         super().__init__()
         from transformers import AutoModel
-        from sentence_transformers import SentenceTransformer
 
-        # RoBERTa-Large as the main model
         if "roberta-large" not in base_name.lower():
             print(f"Warning: Expected roberta-large but got {base_name}. Using roberta-large as base model.")
             base_name = "roberta-large"
         
         self.text_model = AutoModel.from_pretrained(base_name)
         
-        # SBERT model for additional embeddings (pretrained)
-        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Freeze SBERT model parameters to use as a pretrained feature extractor
-        for param in self.sbert_model.parameters():
-            param.requires_grad = False
-        
-        # Get embedding dimension from RoBERTa-Large (should be 1024)
         hidden_size = self.text_model.config.hidden_size
         print(f"RoBERTa-Large hidden size: {hidden_size}")
-        print(f"SBERT embedding dimension: {sbert_dim}")
-        
-        total_dim = hidden_size + sbert_dim
-        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {hidden_size} + SBERT: {sbert_dim})")
         
         # Layer normalization and dropout for regularization
-        self.norm = torch.nn.LayerNorm(total_dim)
+        self.norm = torch.nn.LayerNorm(hidden_size)
         self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(total_dim, 3)  # NLI has 3 classes
+        self.classifier = torch.nn.Linear(hidden_size, 3)  # NLI has 3 classes
 
-    def forward(self, input_ids, attention_mask, texts):
-        # Get RoBERTa embeddings from the main model
+    def forward(self, input_ids, attention_mask):
         outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = outputs.last_hidden_state[:, 0]  # [CLS] token
-        
-        # Get SBERT embeddings (frozen pretrained model)
-        with torch.no_grad():
-            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
-            # Ensure SBERT embeddings are on the same device as RoBERTa embeddings
-            sbert_embeddings = sbert_embeddings.to(pooled.device)
-        
-        # Concatenate RoBERTa + SBERT embeddings
-        concat = torch.cat([pooled, sbert_embeddings], dim=-1)
-            
-        # Apply layer normalization and dropout for regularization
-        concat = self.norm(concat)
-        concat = self.dropout(concat)
-        logits = self.classifier(concat)
+        pooled = outputs.last_hidden_state[:, 0]
+        pooled = self.norm(pooled)
+        pooled = self.dropout(pooled)
+        logits = self.classifier(pooled)
         return logits
 
 
@@ -142,7 +116,6 @@ class VariErrNLISimpleDataset(Dataset):
         result = {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
-            "texts": self.texts[idx],  # Keep original text for SBERT
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
         }
@@ -155,7 +128,6 @@ def collate_fn(batch):
 
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
-    texts = [b["texts"] for b in batch]
     labels = torch.stack([b["labels"] for b in batch])
     dists = torch.stack([b["dist"] for b in batch])
 
@@ -165,7 +137,6 @@ def collate_fn(batch):
     result = {
         "input_ids": input_ids,
         "attention_mask": attn,
-        "texts": texts,
         "labels": labels,
         "dist": dists,
     }
@@ -198,7 +169,6 @@ def evaluate(model, dataloader, device):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
             )
             p_hat = torch.softmax(logits, dim=-1)
             dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
@@ -412,7 +382,6 @@ def train(args):
 
     model = VariErrNLISimpleModel(
         base_name=args.model_name,
-        sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
     )
     model.to(device)
@@ -457,7 +426,6 @@ def train(args):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
             )
 
             p_hat = torch.softmax(logits, dim=-1)
@@ -513,7 +481,6 @@ def train(args):
     metadata = {
         "training_config": {
             "model_name": args.model_name,
-            "sbert_dim": args.sbert_dim,
             "dropout_rate": args.dropout_rate,
             "lr": args.lr,
             "epochs": args.epochs,
@@ -558,7 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
-    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
+
 
     args = parser.parse_args()
     train(args) 

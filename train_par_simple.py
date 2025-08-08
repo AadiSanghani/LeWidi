@@ -16,58 +16,30 @@ import matplotlib.pyplot as plt
 
 
 class ParSimpleModel(torch.nn.Module):
-    """RoBERTa-Large model with SBERT embeddings for paraphrase detection (no demographic embeddings)."""
+    """RoBERTa-Large classifier for paraphrase detection (no SBERT, no demographics)."""
     
-    def __init__(self, base_name: str, sbert_dim: int = 384, dropout_rate: float = 0.3, num_classes: int = 11):
+    def __init__(self, base_name: str, dropout_rate: float = 0.3, num_classes: int = 11):
         super().__init__()
         from transformers import AutoModel
-        from sentence_transformers import SentenceTransformer
 
-        # RoBERTa-Large as the main model
         if "roberta-large" not in base_name.lower():
             print(f"Warning: Expected roberta-large but got {base_name}. Using roberta-large as base model.")
             base_name = "roberta-large"
         
         self.roberta_model = AutoModel.from_pretrained(base_name)
-        
-        # SBERT model for additional embeddings (pretrained)
-        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Freeze SBERT model parameters to use as a pretrained feature extractor
-        for param in self.sbert_model.parameters():
-            param.requires_grad = False
-        
         self.num_classes = num_classes
         
-        # Get embedding dimension from RoBERTa-Large (should be 1024)
         roberta_dim = self.roberta_model.config.hidden_size
         print(f"RoBERTa-Large hidden size: {roberta_dim}")
-        print(f"SBERT embedding dimension: {sbert_dim}")
         
-        total_dim = roberta_dim + sbert_dim
-        print(f"Total combined embedding dimension: {total_dim}")
-        print(f"  - RoBERTa-Large: {roberta_dim}")
-        print(f"  - SBERT: {sbert_dim}")
-
-        # Classification head with dropout
         self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(total_dim, num_classes)
+        self.classifier = torch.nn.Linear(roberta_dim, num_classes)
 
-    def forward(self, input_ids, attention_mask, texts):
-        # Get RoBERTa-Large embeddings
-        roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
-        roberta_pooled = roberta_outputs.pooler_output  # [CLS] token representation
-        
-        # Get SBERT embeddings for the texts (batch processing)
-        sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True, device=roberta_pooled.device)
-        
-        # Combine RoBERTa and SBERT embeddings
-        combined = torch.cat([roberta_pooled, sbert_embeddings], dim=1)
-        
-        # Apply dropout and classification
-        combined = self.dropout(combined)
-        logits = self.classifier(combined)
-        
+    def forward(self, input_ids, attention_mask):
+        outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.pooler_output  # [CLS] token representation
+        pooled = self.dropout(pooled)
+        logits = self.classifier(pooled)
         return logits
 
 
@@ -124,7 +96,6 @@ class ParSimpleDataset(Dataset):
             "attention_mask": enc["attention_mask"].squeeze(0),
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-            "texts": self.texts[idx],  # Include the text for SBERT
         }
         
         return item
@@ -136,8 +107,6 @@ def collate_fn(batch):
     attn = [x["attention_mask"] for x in batch]
     labels = torch.stack([x["labels"] for x in batch])
     dists = torch.stack([x["dist"] for x in batch])
-    texts = [x["texts"] for x in batch]
-
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
     attn = pad_sequence(attn, batch_first=True, padding_value=0)
 
@@ -146,7 +115,6 @@ def collate_fn(batch):
         "attention_mask": attn,
         "labels": labels,
         "dist": dists,
-        "texts": texts,
     }
     
     return result
@@ -177,7 +145,6 @@ def evaluate(model, dataloader, device):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
             )
             
             p_hat = torch.softmax(logits, dim=-1)
@@ -356,7 +323,6 @@ def train(args):
 
     model = ParSimpleModel(
         base_name=args.model_name,
-        sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
         num_classes=args.num_classes,
     )
@@ -404,7 +370,6 @@ def train(args):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
             )
 
             # Use cross-entropy loss with hard labels
@@ -459,7 +424,6 @@ def train(args):
     metadata = {
         "training_config": {
             "model_name": args.model_name,
-            "sbert_dim": args.sbert_dim,
             "dropout_rate": args.dropout_rate,
             "num_classes": args.num_classes,
             "lr": args.lr,
@@ -505,7 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
     parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
     parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
-    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
+
 
     args = parser.parse_args()
     train(args) 

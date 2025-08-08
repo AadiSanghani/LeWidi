@@ -26,11 +26,10 @@ def load_model_and_metadata(model_dir):
     else:
         print(f"No metadata found at {metadata_path}, using defaults")
         metadata = {
-            'training_config': {
-                'model_name': 'roberta-large',
-                'sbert_dim': 384,
-                'dropout_rate': 0.3
-            }
+                    'training_config': {
+            'model_name': 'roberta-large',
+            'dropout_rate': 0.3
+        }
         }
     
     return metadata, device
@@ -57,13 +56,10 @@ def predict_single_example(model, tokenizer, text, device):
     # Move to device
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
-    texts = [text]
-    
     with torch.no_grad():
         logits = model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            texts=texts
+            attention_mask=attention_mask
         )
         probabilities = torch.softmax(logits, dim=-1)
     
@@ -167,12 +163,10 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Create model with the same configuration as training (no demographics)
-    sbert_dim = metadata.get('training_config', {}).get('sbert_dim', 384)
     dropout_rate = metadata.get('training_config', {}).get('dropout_rate', 0.3)
     
     model = VariErrNLISimpleModel(
         base_name=model_name,
-        sbert_dim=sbert_dim,
         dropout_rate=dropout_rate,
     )
     
