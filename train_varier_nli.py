@@ -1,291 +1,4 @@
-def analyze_predictions(predictions, targets, epoch, output_dir):
-    """Analyze prediction distributions and save plots for NLI."""
-    predictions = np.array(predictions)
-    targets = np.array(targets)
-    
-    # Calculate prediction bias for each class
-    pred_bias_contradiction = np.mean(predictions[:, 0] - targets[:, 0])
-    pred_bias_entailment = np.mean(predictions[:, 1] - targets[:, 1])
-    pred_bias_neutral = np.mean(predictions[:, 2] - targets[:, 2])
-    
-    pred_std = np.std(predictions, axis=0)
-    target_std = np.std(targets, axis=0)
-    
-    # Create analysis plots
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Plot 1: Class distribution comparison
-    class_names = ['Contradiction', 'Entailment', 'Neutral']
-    pred_means = np.mean(predictions, axis=0)
-    target_means = np.mean(targets, axis=0)
-    
-    x = np.arange(len(class_names))
-    width = 0.35
-    
-    axes[0, 0].bar(x - width/2, pred_means, width, label='Predictions', alpha=0.7)
-    axes[0, 0].bar(x + width/2, target_means, width, label='Targets', alpha=0.7)
-    axes[0, 0].set_xlabel('Classes')
-    axes[0, 0].set_ylabel('Mean Probability')
-    axes[0, 0].set_title(f'Epoch {epoch}: Class Distribution Comparison')
-    axes[0, 0].set_xticks(x)
-    axes[0, 0].set_xticklabels(class_names)
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Prediction vs Target scatter for dominant class
-    dominant_class = np.argmax(target_means)
-    axes[0, 1].scatter(targets[:, dominant_class], predictions[:, dominant_class], alpha=0.5, s=1)
-    axes[0, 1].plot([0, 1], [0, 1], 'r--', alpha=0.8)
-    axes[0, 1].set_xlabel(f'True P({class_names[dominant_class]})')
-    axes[0, 1].set_ylabel(f'Predicted P({class_names[dominant_class]})')
-    axes[0, 1].set_title(f'Epoch {epoch}: {class_names[dominant_class]} Prediction vs Target')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Error distribution for each class
-    errors = predictions - targets
-    colors = ['red', 'green', 'blue']
-    for i, (class_name, color) in enumerate(zip(class_names, colors)):
-        axes[1, 0].hist(errors[:, i], bins=30, alpha=0.5, label=f'{class_name}', color=color)
-    axes[1, 0].axvline(0, color='black', linestyle='--', alpha=0.8)
-    axes[1, 0].set_xlabel('Prediction Error')
-    axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution by Class')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Plot 4: Confusion matrix (argmax predictions)
-    pred_labels = np.argmax(predictions, axis=1)
-    true_labels = np.argmax(targets, axis=1)
-    confusion = np.zeros((3, 3))
-    for t, p in zip(true_labels, pred_labels):
-        confusion[t, p] += 1
-    
-    im = axes[1, 1].imshow(confusion, interpolation='nearest', cmap=plt.cm.Blues)
-    axes[1, 1].set_title(f'Epoch {epoch}: Confusion Matrix')
-    tick_marks = np.arange(3)
-    axes[1, 1].set_xticks(tick_marks)
-    axes[1, 1].set_yticks(tick_marks)
-    axes[1, 1].set_xticklabels(class_names)
-    axes[1, 1].set_yticklabels(class_names)
-    axes[1, 1].set_ylabel('True Label')
-    axes[1, 1].set_xlabel('Predicted Label')
-    
-    # Add text annotations
-    for i in range(3):
-        for j in range(3):
-            axes[1, 1].text(j, i, int(confusion[i, j]), ha="center", va="center")
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'epoch_{epoch}_analysis.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    accuracy = np.sum(pred_labels == true_labels) / len(true_labels)
-    
-    return {
-        'pred_bias_contradiction': pred_bias_contradiction,
-        'pred_bias_entailment': pred_bias_entailment,
-        'pred_bias_neutral': pred_bias_neutral,
-        'pred_std': pred_std.tolist(),
-        'target_std': target_std.tolist(),
-        'mean_error': np.mean(np.abs(errors)),
-        'accuracy': accuracy
-    }
-
-
-def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
-    """Plot and save training metrics and curves."""
-    epochs_range = list(range(1, len(train_loss_history) + 1))
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-    # Training loss vs validation distance
-    ax_comb = axes[0, 0]
-    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
-    if val_dist_history:
-        ax_comb_twin = ax_comb.twinx()
-        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
-        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
-        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
-    ax_comb.set_title('Training Loss vs Validation Distance')
-    ax_comb.set_xlabel('Epoch')
-    ax_comb.set_ylabel('Training Loss', color='blue')
-    ax_comb.tick_params(axis='y', labelcolor='blue')
-    ax_comb.grid(True, alpha=0.3)
-
-    # Validation distance with best epoch marker
-    if val_dist_history:
-        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
-        axes[0, 1].set_title('Validation Manhattan Distance')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Distance')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
-        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
-
-    # Learning rate schedule
-    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
-    axes[1, 0].set_title('Learning Rate Schedule')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Learning Rate')
-    axes[1, 0].set_yscale('log')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Analysis metrics
-    if analysis_history:
-        accuracies = [a['accuracy'] for a in analysis_history]
-        mean_errors = [a['mean_error'] for a in analysis_history]
-        axes[1, 1].plot(epochs_range, accuracies, marker='o', label='Accuracy', color='purple')
-        ax_twin = axes[1, 1].twinx()
-        ax_twin.plot(epochs_range, mean_errors, marker='s', label='Mean Abs Error', color='brown')
-        axes[1, 1].set_title('Accuracy and Error')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Accuracy', color='purple')
-        ax_twin.set_ylabel('Mean Abs Error', color='brown')
-        axes[1, 1].tick_params(axis='y', labelcolor='purple')
-        ax_twin.tick_params(axis='y', labelcolor='brown')
-        axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Save metrics to JSON
-    metrics = {
-        'train_loss': [float(x) for x in train_loss_history],
-        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
-        'learning_rates': [float(x) for x in lr_history],
-        'analysis': analysis_history,
-        'best_epoch': int(best_epoch) if val_dist_history else None,
-        'best_metric': float(best_metric) if val_dist_history else None
-    }
-    
-    with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-
-def visualize_demog_embeddings(model, dataset: VariErrNLIDataset, output_dir: str):
-    """Save 2-D PCA scatter plots of demographic embeddings."""
-    import matplotlib.pyplot as plt
-    import numpy as np
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Get field names and their display names
-    field_display_names = {
-        "gender": "Gender", 
-        "nationality": "Nationality",
-        "education": "Education"
-    }
-
-    for field_name, emb_layer in model.demographic_embeddings.items():
-        if field_name not in dataset.vocab:
-            continue
-            
-        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
-        
-        emb = emb_layer.weight.detach().cpu().numpy()
-        if emb.shape[0] <= 2:
-            print(f"Skipping {display_name} - not enough embeddings (only {emb.shape[0]})")
-            continue
-        emb = emb[2:]  # Skip PAD and UNK
-        labels = list(dataset.vocab[field_name].keys())[2:]  # Skip PAD and UNK
-        if len(labels) != emb.shape[0]:
-            print(f"Skipping {display_name} - mismatch between labels ({len(labels)}) and embeddings ({emb.shape[0]})")
-            continue
-        
-        # Check if we have enough unique embeddings for PCA
-        if emb.shape[0] < 2:
-            print(f"Skipping {display_name} - need at least 2 unique values for visualization")
-            continue
-        
-        X = emb - emb.mean(axis=0, keepdims=True)
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        
-        # Check if we can do 2D PCA
-        if Vt.shape[0] < 2:
-            print(f"Skipping {display_name} - only {Vt.shape[0]} principal component(s) available")
-            continue
-        
-        # Project to 2D (or 1D if only 1 component available)
-        n_components = min(2, Vt.shape[0], X.shape[0])
-        coords = X.dot(Vt.T[:, :n_components])
-        
-        plt.figure(figsize=(8, 6))
-        
-        if n_components == 2:
-            # Standard 2D plot
-            plt.scatter(coords[:, 0], coords[:, 1], alpha=0.7, s=40)
-            for i, label in enumerate(labels):
-                if i % max(1, len(labels)//30) == 0:
-                    plt.text(coords[i, 0], coords[i, 1], label, fontsize=8, alpha=0.7)
-            plt.xlabel("PC1")
-            plt.ylabel("PC2")
-            plt.title(f"{display_name} Embeddings (PCA-2D)")
-        else:
-            # 1D plot (project to y-axis, use indices for x-axis)
-            x_pos = np.arange(len(coords))
-            plt.scatter(x_pos, coords[:, 0], alpha=0.7, s=40)
-            for i, label in enumerate(labels):
-                if i % max(1, len(labels)//10) == 0:  # Show more labels in 1D
-                    plt.text(x_pos[i], coords[i, 0], label, fontsize=8, alpha=0.7, rotation=45)
-            plt.xlabel("Index")
-            plt.ylabel("PC1")
-            plt.title(f"{display_name} Embeddings (PCA-1D)")
-        
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        fname = os.path.join(output_dir, f"{field_name}_emb_pca.png")
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Saved {display_name} embedding visualisation → {fname}")
-
-
-def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    train_ds = VariErrNLIDataset(args.train_file, tokenizer, args.annot_meta, args.max_length)
-    val_ds = VariErrNLIDataset(args.val_file, tokenizer, args.annot_meta, args.max_length) if args.val_file else None
-
-    print(f"Training samples: {len(train_ds)}")
-    if val_ds:
-        print(f"Validation samples: {len(val_ds)}")
-    print(f"Using reduced demographic fields: {list(train_ds.active_field_keys.keys())}")
-    print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
-
-    # Generate demographic distribution tables
-    generate_demographic_distribution_table(train_ds, args.output_dir, "train")
-    if val_ds:
-        generate_demographic_distribution_table(val_ds, args.output_dir, "validation")
-
-    sampler = build_sampler(train_ds.labels) if args.balance else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
-        collate_fn=collate_fn,
-    )
-    val_loader = (
-        DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
-    )
-
-    model = VariErrNLIDemogModel(
-        base_name=args.model_name,
-        vocab_sizes=train_ds.vocab_sizes,
-        dem_dim=args.dem_dim,
-        sbert_dim=args.sbert_dim,
-        dropout_rate=args.dropout_rate,
-    )
-    model.to(device)
-
-    frozen_layers = []
-    if getattr(args, "freeze_layers", 0) > 0:
-        for layer in model.text_model.encoder.layer[: args.freeze_layers]:
-            for p in layer.parameters():
-                p.requires_grad = False
-        frozen_layers = list(range(args.freeze_layers))
-        if frozen_layers:
-            print(f"Frozen transformer layers:import argparse")
+import argparse
 import json
 import os
 import sys
@@ -300,9 +13,6 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-import seaborn as sns
 
 
 class VariErrNLIDemogModel(torch.nn.Module):
@@ -613,8 +323,6 @@ def evaluate(model, dataloader, device):
     n_examples = 0
     all_predictions = []
     all_targets = []
-    all_embeddings = []
-    all_labels = []
     
     with torch.no_grad():
         for batch in dataloader:
@@ -630,32 +338,6 @@ def evaluate(model, dataloader, device):
                 texts=batch["texts"],
                 **demographic_inputs
             )
-            
-            # Get embeddings for PCA analysis by extracting the final layer features
-            with torch.no_grad():
-                # Get RoBERTa embeddings
-                roberta_outputs = model.text_model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-                roberta_pooled = roberta_outputs.last_hidden_state[:, 0]  # [CLS] token
-                
-                # Get SBERT embeddings
-                sbert_embeddings = model.sbert_model.encode(batch["texts"], convert_to_tensor=True)
-                sbert_embeddings = sbert_embeddings.to(roberta_pooled.device)
-                
-                # Get demographic embeddings
-                demographic_embeds = []
-                for field, emb_layer in model.demographic_embeddings.items():
-                    field_key = f"{field}_ids"
-                    if field_key in demographic_inputs:
-                        embed = emb_layer(demographic_inputs[field_key])
-                        demographic_embeds.append(embed)
-                
-                # Combine embeddings (same as in forward pass but before norm/dropout/classifier)
-                combined_embeddings = [roberta_pooled, sbert_embeddings] + demographic_embeds
-                combined = torch.cat(combined_embeddings, dim=-1)
-                
-                all_embeddings.extend(combined.cpu().numpy())
-                all_labels.extend(batch["labels"].cpu().numpy())
-            
             p_hat = torch.softmax(logits, dim=-1)
             dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
             total_dist += dist.sum().item()
@@ -665,128 +347,7 @@ def evaluate(model, dataloader, device):
             all_predictions.extend(p_hat.cpu().numpy())
             all_targets.extend(batch["dist"].cpu().numpy())
     
-    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets, all_embeddings, all_labels
-
-
-def generate_pca_plot(embeddings, labels, output_dir, model_name="model", epoch=None, save_data=True):
-    """
-    Universal PCA plot generation function that creates and saves PCA visualizations.
-    
-    Args:
-        embeddings: numpy array of embeddings/features
-        labels: numpy array of corresponding labels
-        output_dir: directory to save plots and data
-        model_name: name identifier for the model/experiment
-        epoch: epoch number (optional, for training plots)
-        save_data: whether to save the data as JSON
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Convert to numpy arrays if needed
-    embeddings = np.array(embeddings)
-    labels = np.array(labels)
-    
-    print(f"Generating PCA plot for {len(embeddings)} samples with {embeddings.shape[1]} dimensions")
-    
-    # Perform PCA
-    pca = PCA(n_components=min(50, embeddings.shape[1], len(embeddings)))  # Limit to reasonable number of components
-    pca_embeddings = pca.fit_transform(embeddings)
-    
-    # Print variance explained
-    variance_explained = pca.explained_variance_ratio_
-    cumulative_variance = np.cumsum(variance_explained)
-    
-    print(f"PCA Variance Analysis:")
-    print(f"  PC1 explains {variance_explained[0]:.3f} of variance")
-    print(f"  PC2 explains {variance_explained[1]:.3f} of variance")
-    print(f"  First 2 components explain {cumulative_variance[1]:.3f} of total variance")
-    print(f"  First 10 components explain {cumulative_variance[min(9, len(cumulative_variance)-1)]:.3f} of total variance")
-    
-    # Create the plot
-    plt.figure(figsize=(12, 10))
-    
-    # Create subplot layout
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # Plot 1: PCA scatter plot
-    unique_labels = np.unique(labels)
-    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
-    class_names = ["Contradiction", "Entailment", "Neutral"]
-    
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        label_name = class_names[label] if label < len(class_names) else f'Class {label}'
-        axes[0, 0].scatter(pca_embeddings[mask, 0], pca_embeddings[mask, 1], 
-                          c=[colors[i]], label=label_name, alpha=0.6, s=20)
-    
-    axes[0, 0].set_xlabel(f'PC1 ({variance_explained[0]:.3f} variance)')
-    axes[0, 0].set_ylabel(f'PC2 ({variance_explained[1]:.3f} variance)')
-    axes[0, 0].set_title(f'PCA Visualization - {model_name}' + (f' (Epoch {epoch})' if epoch else ''))
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Variance explained
-    components_to_plot = min(20, len(variance_explained))
-    axes[0, 1].bar(range(1, components_to_plot + 1), variance_explained[:components_to_plot])
-    axes[0, 1].set_xlabel('Principal Component')
-    axes[0, 1].set_ylabel('Variance Explained')
-    axes[0, 1].set_title('Variance Explained by Each PC')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Cumulative variance
-    axes[1, 0].plot(range(1, components_to_plot + 1), cumulative_variance[:components_to_plot], 'b-o')
-    axes[1, 0].axhline(y=0.95, color='r', linestyle='--', alpha=0.7, label='95% variance')
-    axes[1, 0].axhline(y=0.90, color='orange', linestyle='--', alpha=0.7, label='90% variance')
-    axes[1, 0].set_xlabel('Number of Components')
-    axes[1, 0].set_ylabel('Cumulative Variance Explained')
-    axes[1, 0].set_title('Cumulative Variance Explained')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Plot 4: Class distribution
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    class_labels = [class_names[label] if label < len(class_names) else f'Class {label}' for label in unique_labels]
-    axes[1, 1].bar(class_labels, counts)
-    axes[1, 1].set_xlabel('Class Label')
-    axes[1, 1].set_ylabel('Count')
-    axes[1, 1].set_title('Class Distribution')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    epoch_suffix = f"_epoch_{epoch}" if epoch else ""
-    plot_filename = f"pca_plot_{model_name}{epoch_suffix}.png"
-    plot_path = os.path.join(output_dir, plot_filename)
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved PCA plot → {plot_path}")
-    
-    # Save data as JSON if requested
-    if save_data:
-        pca_data = {
-            'pca_embeddings': pca_embeddings[:, :10].tolist(),  # Save first 10 components to keep file size reasonable
-            'labels': labels.tolist(),
-            'variance_explained': variance_explained.tolist(),
-            'cumulative_variance': cumulative_variance.tolist(),
-            'total_samples': len(embeddings),
-            'original_dimensions': embeddings.shape[1],
-            'pca_components_saved': min(10, pca_embeddings.shape[1]),
-            'model_name': model_name,
-            'epoch': epoch,
-            'class_names': class_names
-        }
-        
-        data_filename = f"pca_data_{model_name}{epoch_suffix}.json"
-        data_path = os.path.join(output_dir, data_filename)
-        
-        with open(data_path, 'w') as f:
-            json.dump(pca_data, f, indent=2)
-        
-        print(f"Saved PCA data → {data_path}")
-    
-    return variance_explained, cumulative_variance
+    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets
 
 
 def analyze_predictions(predictions, targets, epoch, output_dir):
@@ -883,36 +444,519 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     }
 
 
-def generate_demographic_distribution_table(dataset, output_dir, dataset_name="dataset"):
-    """Generate and save demographic distribution tables for each demographic field."""
+def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Plot and save training metrics and curves."""
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Training loss vs validation distance
+    ax_comb = axes[0, 0]
+    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+    if val_dist_history:
+        ax_comb_twin = ax_comb.twinx()
+        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
+        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
+    ax_comb.set_title('Training Loss vs Validation Distance')
+    ax_comb.set_xlabel('Epoch')
+    ax_comb.set_ylabel('Training Loss', color='blue')
+    ax_comb.tick_params(axis='y', labelcolor='blue')
+    ax_comb.grid(True, alpha=0.3)
+
+    # Validation distance with best epoch marker
+    if val_dist_history:
+        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
+        axes[0, 1].set_title('Validation Manhattan Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
+        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Analysis metrics
+    if analysis_history:
+        accuracies = [a['accuracy'] for a in analysis_history]
+        mean_errors = [a['mean_error'] for a in analysis_history]
+        axes[1, 1].plot(epochs_range, accuracies, marker='o', label='Accuracy', color='purple')
+        ax_twin = axes[1, 1].twinx()
+        ax_twin.plot(epochs_range, mean_errors, marker='s', label='Mean Abs Error', color='brown')
+        axes[1, 1].set_title('Accuracy and Error')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy', color='purple')
+        ax_twin.set_ylabel('Mean Abs Error', color='brown')
+        axes[1, 1].tick_params(axis='y', labelcolor='purple')
+        ax_twin.tick_params(axis='y', labelcolor='brown')
+        axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Save metrics to JSON
+    metrics = {
+        'train_loss': [float(x) for x in train_loss_history],
+        'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
+        'learning_rates': [float(x) for x in lr_history],
+        'analysis': analysis_history,
+        'best_epoch': int(best_epoch) if val_dist_history else None,
+        'best_metric': float(best_metric) if val_dist_history else None
+    }
+    
+    with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
+def visualize_demog_embeddings(model, dataset, output_dir: str):
+    """Enhanced PCA visualization of demographic embeddings with better error handling and features."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import seaborn as sns
+    try:
+        from sklearn.decomposition import PCA
+        use_sklearn = True
+    except ImportError:
+        use_sklearn = False
+        print("Warning: sklearn not available, using manual PCA")
+    
     os.makedirs(output_dir, exist_ok=True)
     
-    demographic_stats = {}
+    # Set style for better plots
+    plt.style.use('default')
+    if 'seaborn' in sys.modules:
+        sns.set_palette("husl")
+
+    # Get field names and their display names
+    field_display_names = {
+        "gender": "Gender", 
+        "nationality": "Nationality",
+        "education": "Education",
+        "age": "Age",
+        "ethnicity": "Ethnicity",
+        "country_birth": "Country of Birth",
+        "country_residence": "Country of Residence",
+        "student": "Student Status",
+        "employment": "Employment Status"
+    }
+
+    print("Creating PCA visualizations for demographic embeddings...")
     
-    for field in dataset.active_field_keys.keys():
-        field_ids = dataset.demographic_ids[field]
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            print(f"Skipping {field_name} - not found in dataset vocabulary")
+            continue
+            
+        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
         
-        # Create reverse mapping from ID to label
-        id_to_label = {v: k for k, v in dataset.vocab[field].items()}
+        # Get embeddings and labels
+        emb = emb_layer.weight.detach().cpu().numpy()
+        all_labels = list(dataset.vocab[field_name].keys())
         
-        # Count occurrences
-        field_counts = Counter(field_ids)
+        if emb.shape[0] <= 2:
+            print(f"Skipping {display_name} - insufficient embeddings (only {emb.shape[0]})")
+            continue
+            
+        # Skip PAD and UNK tokens
+        emb_clean = emb[2:]  # Remove PAD (index 0) and UNK (index 1)
+        labels_clean = all_labels[2:]  # Remove PAD and UNK labels
         
-        # Create distribution table
-        distribution = {}
-        for id_val, count in field_counts.items():
-            label = id_to_label.get(id_val, f"ID_{id_val}")
-            distribution[label] = count
+        if len(labels_clean) != emb_clean.shape[0]:
+            print(f"Skipping {display_name} - label/embedding mismatch")
+            continue
         
-        demographic_stats[field] = {
-            'distribution': distribution,
-            'total_annotators': len(field_ids),
-            'unique_values': len(field_counts)
-        }
+        if emb_clean.shape[0] < 2:
+            print(f"Skipping {display_name} - need at least 2 categories for visualization")
+            continue
         
-        print(f"\n{field.upper()} Distribution in {dataset_name}:")
-        print(f"Total annotators: {len(field_ids)}")
-        print(f"Unique values: {len(field_counts)}")
-        for label, count in sorted(distribution.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / len(field_ids)) * 100
-            print(f"  {label}: {
+        # Center the embeddings
+        emb_centered = emb_clean - emb_clean.mean(axis=0)
+        
+        # Use sklearn PCA if available, otherwise manual PCA
+        try:
+            # Determine number of components
+            n_samples, n_features = emb_centered.shape
+            n_components = min(2, n_features, n_samples)
+            
+            if n_components < 1:
+                print(f"Skipping {display_name} - insufficient dimensions")
+                continue
+            
+            if use_sklearn:
+                pca = PCA(n_components=n_components)
+                coords = pca.fit_transform(emb_centered)
+                explained_var = pca.explained_variance_ratio_
+            else:
+                # Manual PCA using SVD
+                U, S, Vt = np.linalg.svd(emb_centered, full_matrices=False)
+                n_components = min(n_components, Vt.shape[0])
+                coords = emb_centered.dot(Vt.T[:, :n_components])
+                # Calculate explained variance manually
+                total_var = np.sum(S**2)
+                explained_var = (S[:n_components]**2) / total_var
+            
+            # Create figure
+            fig, axes = plt.subplots(1, 2 if n_components == 2 else 1, 
+                                   figsize=(16, 6) if n_components == 2 else (10, 6))
+            if n_components == 1:
+                axes = [axes]  # Make it iterable
+            
+            # Main PCA plot
+            ax_main = axes[0]
+            
+            if n_components == 2:
+                # 2D scatter plot
+                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
+                scatter = ax_main.scatter(coords[:, 0], coords[:, 1], 
+                                        c=colors, alpha=0.8, s=100, edgecolors='black', linewidth=0.5)
+                
+                # Add labels with smart positioning to avoid overlap
+                for i, label in enumerate(labels_clean):
+                    # Only show label if it's not too crowded
+                    if i % max(1, len(labels_clean) // 15) == 0 or len(labels_clean) <= 10:
+                        ax_main.annotate(label, (coords[i, 0], coords[i, 1]), 
+                                       xytext=(5, 5), textcoords='offset points',
+                                       fontsize=9, alpha=0.8, 
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+                
+                ax_main.set_xlabel(f"PC1 ({explained_var[0]:.1%} variance)")
+                ax_main.set_ylabel(f"PC2 ({explained_var[1]:.1%} variance)")
+                ax_main.set_title(f"{display_name} Embeddings (PCA 2D)")
+                
+                # Variance explained plot
+                if len(axes) > 1:
+                    ax_var = axes[1]
+                    ax_var.bar(['PC1', 'PC2'], explained_var, color=['skyblue', 'lightcoral'])
+                    ax_var.set_ylabel('Explained Variance Ratio')
+                    ax_var.set_title('Variance Explained by Components')
+                    ax_var.set_ylim(0, 1)
+                    for i, v in enumerate(explained_var):
+                        ax_var.text(i, v + 0.02, f'{v:.1%}', ha='center', va='bottom')
+                        
+            else:
+                # 1D plot
+                x_pos = np.arange(len(coords))
+                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
+                ax_main.scatter(x_pos, coords[:, 0], c=colors, alpha=0.8, s=100, 
+                              edgecolors='black', linewidth=0.5)
+                
+                # Add labels
+                for i, label in enumerate(labels_clean):
+                    if i % max(1, len(labels_clean) // 10) == 0:  # Show more labels in 1D
+                        ax_main.annotate(label, (x_pos[i], coords[i, 0]), 
+                                       xytext=(0, 10), textcoords='offset points',
+                                       fontsize=9, alpha=0.8, rotation=45,
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+                
+                ax_main.set_xlabel("Category Index")
+                ax_main.set_ylabel(f"PC1 ({explained_var[0]:.1%} variance)")
+                ax_main.set_title(f"{display_name} Embeddings (PCA 1D)")
+                ax_main.set_xticks(x_pos[::max(1, len(x_pos)//10)])
+            
+            # Add grid and improve aesthetics
+            for ax in axes:
+                ax.grid(True, alpha=0.3)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+            
+            plt.tight_layout()
+            
+            # Save plot
+            fname = os.path.join(output_dir, f"{field_name}_embeddings_pca.png")
+            plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
+            
+            print(f"✓ Saved {display_name} PCA visualization → {fname}")
+            print(f"  - {len(labels_clean)} categories, {n_components}D projection")
+            if n_components == 2:
+                print(f"  - Explained variance: PC1={explained_var[0]:.1%}, PC2={explained_var[1]:.1%}")
+            else:
+                print(f"  - Explained variance: PC1={explained_var[0]:.1%}")
+                
+        except Exception as e:
+            print(f"Error creating PCA plot for {display_name}: {e}")
+            continue
+    
+    print("PCA visualization complete!")
+
+
+def create_embedding_summary_plot(model, dataset, output_dir: str):
+    """Create a summary plot showing embedding space dimensions and distributions."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    
+    # Collect information about all embeddings
+    embedding_info = {}
+    
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            continue
+            
+        emb = emb_layer.weight.detach().cpu().numpy()
+        vocab_size = len(dataset.vocab[field_name])
+        
+        # Calculate embedding statistics
+        emb_clean = emb[2:]  # Skip PAD and UNK
+        if emb_clean.shape[0] > 0:
+            embedding_info[field_name] = {
+                'vocab_size': vocab_size - 2,  # Exclude PAD and UNK
+                'embedding_dim': emb.shape[1],
+                'mean_norm': np.mean(np.linalg.norm(emb_clean, axis=1)),
+                'std_norm': np.std(np.linalg.norm(emb_clean, axis=1)),
+                'mean_cosine_sim': np.mean([
+                    np.dot(emb_clean[i], emb_clean[j]) / 
+                    (np.linalg.norm(emb_clean[i]) * np.linalg.norm(emb_clean[j]))
+                    for i in range(len(emb_clean)) for j in range(i+1, len(emb_clean))
+                ]) if len(emb_clean) > 1 else 0
+            }
+    
+    if not embedding_info:
+        return
+    
+    # Create summary plot
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    fields = list(embedding_info.keys())
+    field_display_names = {
+        "gender": "Gender", "nationality": "Nationality", "education": "Education",
+        "age": "Age", "ethnicity": "Ethnicity"
+    }
+    display_fields = [field_display_names.get(f, f.replace("_", " ").title()) for f in fields]
+    
+    # Plot 1: Vocabulary sizes
+    vocab_sizes = [embedding_info[f]['vocab_size'] for f in fields]
+    axes[0, 0].bar(display_fields, vocab_sizes, color='skyblue', alpha=0.7)
+    axes[0, 0].set_title('Vocabulary Sizes')
+    axes[0, 0].set_ylabel('Number of Categories')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    # Plot 2: Embedding norms
+    mean_norms = [embedding_info[f]['mean_norm'] for f in fields]
+    std_norms = [embedding_info[f]['std_norm'] for f in fields]
+    axes[0, 1].bar(display_fields, mean_norms, yerr=std_norms, 
+                   color='lightcoral', alpha=0.7, capsize=5)
+    axes[0, 1].set_title('Embedding Norms (Mean ± Std)')
+    axes[0, 1].set_ylabel('L2 Norm')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    
+    # Plot 3: Cosine similarities
+    cosine_sims = [embedding_info[f]['mean_cosine_sim'] for f in fields]
+    axes[1, 0].bar(display_fields, cosine_sims, color='lightgreen', alpha=0.7)
+    axes[1, 0].set_title('Mean Pairwise Cosine Similarity')
+    axes[1, 0].set_ylabel('Cosine Similarity')
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    axes[1, 0].set_ylim(-1, 1)
+    
+    # Plot 4: Embedding dimensions
+    emb_dims = [embedding_info[f]['embedding_dim'] for f in fields]
+    axes[1, 1].bar(display_fields, emb_dims, color='gold', alpha=0.7)
+    axes[1, 1].set_title('Embedding Dimensions')
+    axes[1, 1].set_ylabel('Dimension')
+    axes[1, 1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    summary_path = os.path.join(output_dir, 'demographic_embeddings_summary.png')
+    plt.savefig(summary_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"✓ Saved embedding summary plot → {summary_path}")
+
+
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    train_ds = VariErrNLIDataset(args.train_file, tokenizer, args.annot_meta, args.max_length)
+    val_ds = VariErrNLIDataset(args.val_file, tokenizer, args.annot_meta, args.max_length) if args.val_file else None
+
+    print(f"Training samples: {len(train_ds)}")
+    if val_ds:
+        print(f"Validation samples: {len(val_ds)}")
+    print(f"Using reduced demographic fields: {list(train_ds.active_field_keys.keys())}")
+    print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
+
+    sampler = build_sampler(train_ds.labels) if args.balance else None
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        collate_fn=collate_fn,
+    )
+    val_loader = (
+        DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
+    )
+
+    model = VariErrNLIDemogModel(
+        base_name=args.model_name,
+        vocab_sizes=train_ds.vocab_sizes,
+        dem_dim=args.dem_dim,
+        sbert_dim=args.sbert_dim,
+        dropout_rate=args.dropout_rate,
+    )
+    model.to(device)
+
+    frozen_layers = []
+    if getattr(args, "freeze_layers", 0) > 0:
+        for layer in model.text_model.encoder.layer[: args.freeze_layers]:
+            for p in layer.parameters():
+                p.requires_grad = False
+        frozen_layers = list(range(args.freeze_layers))
+        if frozen_layers:
+            print(f"Frozen transformer layers: {frozen_layers} for first {args.freeze_epochs} epoch(s)")
+
+    no_decay = ["bias", "LayerNorm.weight"]
+    grouped_params = [
+        {"params": [p for n,p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         "weight_decay": args.weight_decay},
+        {"params": [p for n,p in model.named_parameters() if any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    optimiser = AdamW(grouped_params, lr=args.lr)
+
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+                   optimiser,
+                   num_warmup_steps=warmup_steps,
+                   num_training_steps=total_steps)
+
+    best_metric = float("inf")
+    epochs_no_improve = 0
+    best_epoch = 0
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    train_loss_history = []
+    val_dist_history = []
+    lr_history = []
+    analysis_history = []
+
+    print(f"Total training steps: {total_steps}")
+    print(f"Initial learning rate: {args.lr}")
+
+    for epoch in range(1, args.epochs + 1):
+        if frozen_layers and epoch > args.freeze_epochs:
+            for layer_idx in frozen_layers:
+                for p in model.text_model.encoder.layer[layer_idx].parameters():
+                    p.requires_grad = True
+            print(f"Unfroze layers {frozen_layers} at start of epoch {epoch}")
+            frozen_layers = []
+
+        model.train()
+        epoch_loss = 0.0
+        step_count = 0
+        
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+            # Prepare demographic inputs dynamically (exclude input_ids, attention_mask, texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                texts=batch["texts"],
+                **demographic_inputs
+            )
+
+            p_hat = torch.softmax(logits, dim=-1)
+            # Soft cross-entropy: -sum(target_dist * log(predicted_dist))
+            cross_entropy_loss = -torch.sum(batch["dist"] * torch.log(p_hat + 1e-12), dim=-1).mean()
+            loss = cross_entropy_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+            scheduler.step()
+            optimiser.zero_grad()
+
+            epoch_loss += loss.item()
+            step_count += 1
+            
+            if step % 100 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                avg_loss = epoch_loss / step_count
+                tqdm.write(f"Epoch {epoch} step {step}: cross_entropy_loss={avg_loss:.4f}, lr={current_lr:.2e}")
+
+        if val_loader:
+            val_dist, predictions, targets = evaluate(model, val_loader, device)
+            print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
+            
+            analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
+            analysis_history.append(analysis)
+            
+            print(f"Epoch {epoch} Analysis:")
+            print(f"  Accuracy: {analysis['accuracy']:.4f}")
+            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
+            print(f"  Prediction bias (C/E/N): {analysis['pred_bias_contradiction']:.4f}/{analysis['pred_bias_entailment']:.4f}/{analysis['pred_bias_neutral']:.4f}")
+            
+            if val_dist < best_metric:
+                best_metric = val_dist
+                best_epoch = epoch
+                epochs_no_improve = 0
+                save_path = os.path.join(args.output_dir, "best_model")
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
+                tokenizer.save_pretrained(save_path)
+                print(f"New best model saved to {save_path}")
+            else:
+                epochs_no_improve += 1
+
+        train_loss_history.append(epoch_loss / step_count)
+        if val_loader:
+            val_dist_history.append(val_dist)
+        lr_history.append(scheduler.get_last_lr()[0])
+
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    final_path = os.path.join(args.output_dir, "last_model")
+    os.makedirs(final_path, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
+    tokenizer.save_pretrained(final_path)
+
+    # Create visualizations
+    print("\nCreating demographic embedding visualizations...")
+    visualize_demog_embeddings(model, train_ds, args.output_dir)
+    create_embedding_summary_plot(model, train_ds, args.output_dir)
+    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+
+    print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
+    if val_dist_history:
+        print(f"Best epoch: {best_epoch}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT and demographic embeddings on VariErr NLI using cross-entropy loss with soft labels.")
+    parser.add_argument("--train_file", type=str, default="dataset/VariErrNLI/VariErrNLI_train.json", help="Path to VariErrNLI_train.json")
+    parser.add_argument("--val_file", type=str, default="dataset/VariErrNLI/VariErrNLI_dev.json", help="Path to VariErrNLI_dev.json")
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="HF model name")
+    parser.add_argument("--output_dir", type=str, default="runs/outputs_varier_nli")
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
+
+    parser.add_argument("--annot_meta", type=str, default="dataset/VariErrNLI/VariErrNLI_annotators_meta.json", help="Path to annotator metadata JSON")
+    parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
+    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
+    parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
+    parser.add_argument("--freeze_layers", type=int, default=0, help="Number of layers to freeze")
+    parser.add_argument("--freeze_epochs", type=int, default=1, help="Number of epochs to freeze layers")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
+    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
+
+    args = parser.parse_args()
+    train(args)

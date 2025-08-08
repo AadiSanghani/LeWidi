@@ -13,26 +13,22 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-import seaborn as sns
 
 
-class ParModel(torch.nn.Module):
-    """RoBERTa-Large model with SBERT embeddings for paraphrase detection (no demographics)."""
+class ParDemogModel(torch.nn.Module):
+    """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware paraphrase detection."""
     
-    def __init__(self, base_name: str, sbert_dim: int = 384, dropout_rate: float = 0.3, num_classes: int = 11):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3):
         super().__init__()
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoModel
         from sentence_transformers import SentenceTransformer
 
-        # RoBERTa-Large as the main model
+        # RoBERTa-Large as the main model (ensure we're using roberta-large)
         if "roberta-large" not in base_name.lower():
             print(f"Warning: Expected roberta-large but got {base_name}. Using roberta-large as base model.")
             base_name = "roberta-large"
         
-        self.roberta_model = AutoModel.from_pretrained(base_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(base_name)
+        self.text_model = AutoModel.from_pretrained(base_name)
         
         # SBERT model for additional embeddings (pretrained)
         self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -41,78 +37,221 @@ class ParModel(torch.nn.Module):
         for param in self.sbert_model.parameters():
             param.requires_grad = False
         
-        self.num_classes = num_classes
-        
+        # Create demographic embeddings dynamically based on vocab_sizes
+        self.demographic_embeddings = torch.nn.ModuleDict()
+        for field, vocab_size in vocab_sizes.items():
+            self.demographic_embeddings[field] = torch.nn.Embedding(vocab_size, dem_dim, padding_idx=0)
+
         # Get embedding dimension from RoBERTa-Large (should be 1024)
-        roberta_dim = self.roberta_model.config.hidden_size
-        print(f"RoBERTa-Large hidden size: {roberta_dim}")
+        hidden_size = self.text_model.config.hidden_size
+        print(f"RoBERTa-Large hidden size: {hidden_size}")
+        print(f"SBERT embedding dimension: {sbert_dim}")
         
-        # Combined dimension: RoBERTa + SBERT (no demographics)
-        self.combined_dim = roberta_dim + sbert_dim
+        num_demog_fields = len(vocab_sizes)
+        total_dim = hidden_size + sbert_dim + num_demog_fields * dem_dim
+        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {hidden_size} + SBERT: {sbert_dim} + Demographics: {num_demog_fields * dem_dim})")
         
-        print(f"Total combined embedding dimension: {self.combined_dim}")
-        print(f"  - RoBERTa-Large: {roberta_dim}")
-        print(f"  - SBERT: {sbert_dim}")
-        print(f"  - Demographics: 0 (disabled)")
-
-        # Classification head with dropout
+        # Layer normalization and dropout for regularization
+        self.norm = torch.nn.LayerNorm(total_dim)
         self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(self.combined_dim, num_classes)
+        self.classifier = torch.nn.Linear(total_dim, 11)  # Likert scale -5 to +5 (11 classes)
 
-    def forward(self, input_ids, attention_mask, texts):
-        # Get RoBERTa-Large embeddings
-        roberta_outputs = self.roberta_model(input_ids=input_ids, attention_mask=attention_mask)
-        roberta_pooled = roberta_outputs.pooler_output  # [CLS] token representation
+    def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
+        # Get RoBERTa embeddings from the main model
+        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state[:, 0]  # [CLS] token
         
-        # Get SBERT embeddings for the texts (batch processing)
-        sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True, device=roberta_pooled.device)
+        # Get SBERT embeddings (frozen pretrained model)
+        with torch.no_grad():
+            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
+            # Ensure SBERT embeddings are on the same device as RoBERTa embeddings
+            sbert_embeddings = sbert_embeddings.to(pooled.device)
         
-        # Combine RoBERTa and SBERT embeddings only
-        combined = torch.cat([roberta_pooled, sbert_embeddings], dim=1)
-        
-        # Apply dropout and classification
-        combined = self.dropout(combined)
-        logits = self.classifier(combined)
-        
+        # Get demographic embeddings dynamically
+        demographic_vectors = []
+        for field, emb_layer in self.demographic_embeddings.items():
+            field_key = f"{field}_ids"
+            if field_key in demographic_inputs:
+                demographic_vec = emb_layer(demographic_inputs[field_key])
+                demographic_vectors.append(demographic_vec)
+
+        # Concatenate all vectors: RoBERTa + SBERT + demographics
+        all_vectors = [pooled, sbert_embeddings] + demographic_vectors
+        concat = torch.cat(all_vectors, dim=-1)
+            
+        # Apply layer normalization and dropout for regularization
+        concat = self.norm(concat)
+        concat = self.dropout(concat)
+        logits = self.classifier(concat)
         return logits
 
 
 class ParDataset(Dataset):
-    """PyTorch dataset for the Paraphrase detection data without demographic information."""
-    
-    def __init__(self, path: str, tokenizer: AutoTokenizer, max_length: int = 512):
+    """Dataset with demographic embeddings for paraphrase detection."""
+
+    PAD_IDX = 0  # padding
+    UNK_IDX = 1  # unknown / missing
+
+    FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender",
+        "ethnicity": "Ethnicity simplified",
+        "country_birth": "Country of birth",
+        "country_residence": "Country of residence",
+        "nationality": "Nationality",
+        "student": "Student status",
+        "employment": "Employment status",
+        "education": "Education",
+    }
+
+    # Reduced field set for better performance
+    REDUCED_FIELD_KEYS = {
+        "age": "Age",  # Will be binned
+        "gender": "Gender", 
+        "nationality": "Nationality",
+        "education": "Education",
+    }
+
+    @staticmethod
+    def get_age_bin(age):
+        """Convert age to age bin."""
+        if age is None or str(age).strip() == "" or str(age) == "DATA_EXPIRED":
+            return "<UNK>"
+        try:
+            age_int = int(age)
+            if age_int < 25:
+                return "18-24"
+            elif age_int < 35:
+                return "25-34"
+            elif age_int < 45:
+                return "35-44"
+            elif age_int < 55:
+                return "45-54"
+            else:
+                return "55+"
+        except (ValueError, TypeError):
+            return "<UNK>"
+
+    def __init__(self, path: str, tokenizer: AutoTokenizer, annot_meta_path: str, max_length: int = 512):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.texts = []
-        self.dists = []
-        self.labels = []
         
+        # Always use reduced demographics for better performance
+        self.active_field_keys = self.REDUCED_FIELD_KEYS
+
+        self.texts = []
+        self.labels = []
+        self.dists = []
+        
+        # Initialize storage for active fields only - storing single values per example
+        self.demographic_ids = {field: [] for field in self.active_field_keys}
+
+        # Load annotator metadata
+        with open(annot_meta_path, "r", encoding="utf-8") as f:
+            self.annot_meta = json.load(f)
+
+        # Build vocabularies for demographic fields
+        self.vocab = {
+            field: {"<PAD>": self.PAD_IDX, "<UNK>": self.UNK_IDX}
+            for field in self.active_field_keys
+        }
+
+        # Build vocabulary from all annotators
+        for ann_data in self.annot_meta.values():
+            for field, json_key in self.active_field_keys.items():
+                if field == "age":
+                    # Special handling for age - convert to age bin
+                    age_bin = self.get_age_bin(ann_data.get(json_key))
+                    if age_bin not in self.vocab[field]:
+                        self.vocab[field][age_bin] = len(self.vocab[field])
+                else:
+                    val = str(ann_data.get(json_key, "")).strip()
+                    if val == "":
+                        val = "<UNK>"
+                    if val not in self.vocab[field]:
+                        self.vocab[field][val] = len(self.vocab[field])
+
+        self.vocab_sizes = {field: len(v) for field, v in self.vocab.items()}
+
+        # Load data
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        for ex in data.values():
-            question1 = ex["text"].get("Question1", "")
-            question2 = ex["text"].get("Question2", "")
-            full_text = f"{question1} [SEP] {question2}".strip()
+        for ex_id, ex in data.items():
+            # Build input text for paraphrase: question1 + [SEP] + question2
+            question1 = ex["text"]["Question1"]
+            question2 = ex["text"]["Question2"]
+            full_text = f"{question1} {tokenizer.sep_token} {question2}".strip()
 
-            soft_label = ex.get("soft_label", {})
-            if not soft_label or soft_label == "":
-                continue
+            # Create soft distribution from annotations (Likert scale -5 to +5)
+            annotators = ex.get("annotators", "").split(",")
+            annotations = ex.get("annotations", {})
             
-            # Convert to 11-class distribution (-5 to 5)
-            soft_label_list = [float(soft_label.get(str(i), 0.0)) for i in range(-5, 6)]
-            dist = np.array(soft_label_list, dtype=np.float32)
-            if dist.sum() == 0:
-                continue
+            # Create soft distribution from ratings
+            rating_counts = Counter()
+            for annotator in annotators:
+                annotator = annotator.strip()
+                if annotator in annotations:
+                    rating = annotations[annotator]
+                    if isinstance(rating, (int, float, str)) and str(rating).lstrip('-').isdigit():
+                        rating_val = int(rating)
+                        if -5 <= rating_val <= 5:
+                            # Map from -5:5 to 0:10
+                            mapped_rating = rating_val + 5
+                            rating_counts[mapped_rating] += 1
+
+            # Create soft distribution
+            total_annotations = sum(rating_counts.values())
+            if total_annotations > 0:
+                dist = np.array([0.0] * 11, dtype=np.float32)  # 11 classes for -5 to +5
+                for rating, count in rating_counts.items():
+                    dist[rating] = count / total_annotations
+            else:
+                dist = np.array([1/11] * 11, dtype=np.float32)  # Uniform if no valid annotations
+
             dist /= dist.sum()
             hard_label = int(np.argmax(dist))
 
-            # Add example (no demographic processing)
-            self.texts.append(full_text)
-            self.dists.append(dist)
-            self.labels.append(hard_label)
-                    
-        print(f"Dataset created with {len(self.texts)} examples")
+            ann_list = [a.strip() for a in annotators if a.strip()] if annotators else []
+
+            # Create separate examples for each annotator
+            for ann_tag in ann_list:
+                ann_num = ann_tag  # Paraphrase uses Ann1, Ann2, etc. directly
+                meta = self.annot_meta.get(ann_num, {})
+                
+                # Get demographic info for this specific annotator
+                annotator_demog_ids = {}
+                for field, json_key in self.active_field_keys.items():
+                    if field == "age":
+                        age_bin = self.get_age_bin(meta.get(json_key))
+                        idx = self.vocab[field].get(age_bin, self.UNK_IDX)
+                    else:
+                        val = str(meta.get(json_key, "")).strip()
+                        if val == "":
+                            val = "<UNK>"
+                        idx = self.vocab[field].get(val, self.UNK_IDX)
+                    annotator_demog_ids[field] = idx
+
+                # Add this annotator's example
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store single demographic IDs for this annotator
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(annotator_demog_ids[field])
+
+            # If no annotators, create one example with UNK demographic info
+            if not ann_list:
+                self.texts.append(full_text)
+                self.dists.append(dist)
+                self.labels.append(hard_label)
+                
+                # Store UNK demographic IDs
+                for field in self.active_field_keys:
+                    self.demographic_ids[field].append(self.UNK_IDX)
+
+        print(f"Dataset created with {len(self.texts)} examples (expanded from {len(data)} original examples)")
 
     def __len__(self):
         return len(self.labels)
@@ -125,26 +264,29 @@ class ParDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-        
-        # Create the item dictionary (no demographic fields)
-        item = {
+        result = {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
+            "texts": self.texts[idx],  # Keep original text for SBERT
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
-            "texts": self.texts[idx],  # Include the text for SBERT
         }
         
-        return item
+        # Add demographic fields dynamically
+        for field in self.active_field_keys:
+            result[f"{field}_ids"] = torch.tensor(self.demographic_ids[field][idx], dtype=torch.long)
+        
+        return result
 
 
 def collate_fn(batch):
-    """Pads a batch of variable-length encoded examples."""
-    input_ids = [x["input_ids"] for x in batch]
-    attn = [x["attention_mask"] for x in batch]
-    labels = torch.stack([x["labels"] for x in batch])
-    dists = torch.stack([x["dist"] for x in batch])
-    texts = [x["texts"] for x in batch]
+    """Pads text and handles single demographic values."""
+
+    input_ids = [b["input_ids"] for b in batch]
+    attn = [b["attention_mask"] for b in batch]
+    texts = [b["texts"] for b in batch]
+    labels = torch.stack([b["labels"] for b in batch])
+    dists = torch.stack([b["dist"] for b in batch])
 
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=1)  # RoBERTa pad token id = 1
     attn = pad_sequence(attn, batch_first=True, padding_value=0)
@@ -152,16 +294,25 @@ def collate_fn(batch):
     result = {
         "input_ids": input_ids,
         "attention_mask": attn,
+        "texts": texts,
         "labels": labels,
         "dist": dists,
-        "texts": texts,
     }
     
+    # Dynamically handle demographic fields - now single values, not lists
+    demographic_keys = [k for k in batch[0].keys() 
+                        if k.endswith("_ids") and k not in ["input_ids"]]
+    for key in demographic_keys:
+        tensors = [b[key] for b in batch]
+        # Stack single values instead of padding lists
+        stacked = torch.stack(tensors)
+        result[key] = stacked
+
     return result
 
 
 def build_sampler(labels):
-    """Returns a WeightedRandomSampler to alleviate class imbalance."""
+    """Create WeightedRandomSampler to balance classes."""
     counts = Counter(labels)
     total = float(sum(counts.values()))
     num_classes = len(counts)
@@ -177,34 +328,21 @@ def evaluate(model, dataloader, device):
     n_examples = 0
     all_predictions = []
     all_targets = []
-    all_embeddings = []
-    all_labels = []
     
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
+            # Prepare demographic inputs dynamically (exclude input_ids, attention_mask, texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
+                texts=batch["texts"],
+                **demographic_inputs
             )
-            
-            # Get embeddings for PCA analysis by extracting the final layer features
-            with torch.no_grad():
-                # Get RoBERTa embeddings
-                roberta_outputs = model.roberta_model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-                roberta_pooled = roberta_outputs.pooler_output
-                
-                # Get SBERT embeddings
-                sbert_embeddings = model.sbert_model.encode(batch["texts"], convert_to_tensor=True, device=roberta_pooled.device)
-                
-                # Combine embeddings (same as in forward pass but before dropout/classifier)
-                combined = torch.cat([roberta_pooled, sbert_embeddings], dim=1)
-                
-                all_embeddings.extend(combined.cpu().numpy())
-                all_labels.extend(batch["labels"].cpu().numpy())
-            
             p_hat = torch.softmax(logits, dim=-1)
             dist = torch.sum(torch.abs(p_hat - batch["dist"]), dim=-1)
             total_dist += dist.sum().item()
@@ -214,124 +352,7 @@ def evaluate(model, dataloader, device):
             all_predictions.extend(p_hat.cpu().numpy())
             all_targets.extend(batch["dist"].cpu().numpy())
     
-    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets, all_embeddings, all_labels
-
-
-def generate_pca_plot(embeddings, labels, output_dir, model_name="model", epoch=None, save_data=True):
-    """
-    Universal PCA plot generation function that creates and saves PCA visualizations.
-    
-    Args:
-        embeddings: numpy array of embeddings/features
-        labels: numpy array of corresponding labels
-        output_dir: directory to save plots and data
-        model_name: name identifier for the model/experiment
-        epoch: epoch number (optional, for training plots)
-        save_data: whether to save the data as JSON
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Convert to numpy arrays if needed
-    embeddings = np.array(embeddings)
-    labels = np.array(labels)
-    
-    print(f"Generating PCA plot for {len(embeddings)} samples with {embeddings.shape[1]} dimensions")
-    
-    # Perform PCA
-    pca = PCA(n_components=min(50, embeddings.shape[1], len(embeddings)))  # Limit to reasonable number of components
-    pca_embeddings = pca.fit_transform(embeddings)
-    
-    # Print variance explained
-    variance_explained = pca.explained_variance_ratio_
-    cumulative_variance = np.cumsum(variance_explained)
-    
-    print(f"PCA Variance Analysis:")
-    print(f"  PC1 explains {variance_explained[0]:.3f} of variance")
-    print(f"  PC2 explains {variance_explained[1]:.3f} of variance")
-    print(f"  First 2 components explain {cumulative_variance[1]:.3f} of total variance")
-    print(f"  First 10 components explain {cumulative_variance[min(9, len(cumulative_variance)-1)]:.3f} of total variance")
-    
-    # Create the plot
-    plt.figure(figsize=(12, 10))
-    
-    # Create subplot layout
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # Plot 1: PCA scatter plot
-    unique_labels = np.unique(labels)
-    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
-    
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        axes[0, 0].scatter(pca_embeddings[mask, 0], pca_embeddings[mask, 1], 
-                          c=[colors[i]], label=f'Class {label}', alpha=0.6, s=20)
-    
-    axes[0, 0].set_xlabel(f'PC1 ({variance_explained[0]:.3f} variance)')
-    axes[0, 0].set_ylabel(f'PC2 ({variance_explained[1]:.3f} variance)')
-    axes[0, 0].set_title(f'PCA Visualization - {model_name}' + (f' (Epoch {epoch})' if epoch else ''))
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Variance explained
-    components_to_plot = min(20, len(variance_explained))
-    axes[0, 1].bar(range(1, components_to_plot + 1), variance_explained[:components_to_plot])
-    axes[0, 1].set_xlabel('Principal Component')
-    axes[0, 1].set_ylabel('Variance Explained')
-    axes[0, 1].set_title('Variance Explained by Each PC')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Cumulative variance
-    axes[1, 0].plot(range(1, components_to_plot + 1), cumulative_variance[:components_to_plot], 'b-o')
-    axes[1, 0].axhline(y=0.95, color='r', linestyle='--', alpha=0.7, label='95% variance')
-    axes[1, 0].axhline(y=0.90, color='orange', linestyle='--', alpha=0.7, label='90% variance')
-    axes[1, 0].set_xlabel('Number of Components')
-    axes[1, 0].set_ylabel('Cumulative Variance Explained')
-    axes[1, 0].set_title('Cumulative Variance Explained')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Plot 4: Class distribution
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    axes[1, 1].bar(unique_labels, counts)
-    axes[1, 1].set_xlabel('Class Label')
-    axes[1, 1].set_ylabel('Count')
-    axes[1, 1].set_title('Class Distribution')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    epoch_suffix = f"_epoch_{epoch}" if epoch else ""
-    plot_filename = f"pca_plot_{model_name}{epoch_suffix}.png"
-    plot_path = os.path.join(output_dir, plot_filename)
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved PCA plot → {plot_path}")
-    
-    # Save data as JSON if requested
-    if save_data:
-        pca_data = {
-            'pca_embeddings': pca_embeddings[:, :10].tolist(),  # Save first 10 components to keep file size reasonable
-            'labels': labels.tolist(),
-            'variance_explained': variance_explained.tolist(),
-            'cumulative_variance': cumulative_variance.tolist(),
-            'total_samples': len(embeddings),
-            'original_dimensions': embeddings.shape[1],
-            'pca_components_saved': min(10, pca_embeddings.shape[1]),
-            'model_name': model_name,
-            'epoch': epoch
-        }
-        
-        data_filename = f"pca_data_{model_name}{epoch_suffix}.json"
-        data_path = os.path.join(output_dir, data_filename)
-        
-        with open(data_path, 'w') as f:
-            json.dump(pca_data, f, indent=2)
-        
-        print(f"Saved PCA data → {data_path}")
-    
-    return variance_explained, cumulative_variance
+    return total_dist / n_examples if n_examples else 0.0, all_predictions, all_targets
 
 
 def analyze_predictions(predictions, targets, epoch, output_dir):
@@ -339,102 +360,428 @@ def analyze_predictions(predictions, targets, epoch, output_dir):
     predictions = np.array(predictions)
     targets = np.array(targets)
     
-    # Calculate prediction bias (for class 5, which is the highest rating)
-    pred_bias = np.mean(predictions[:, 10] - targets[:, 10])  # bias toward class 5
-    pred_std = np.std(predictions[:, 10])
-    target_std = np.std(targets[:, 10])
+    # Calculate prediction statistics
+    pred_mean = np.mean(predictions, axis=0)
+    target_mean = np.mean(targets, axis=0)
+    pred_std = np.std(predictions, axis=0)
+    target_std = np.std(targets, axis=0)
+    
+    # Calculate overall bias (weighted by class frequency)
+    overall_bias = np.sum((pred_mean - target_mean) * target_mean)
     
     # Create analysis plots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # Plot 1: Prediction vs Target scatter (for highest class)
-    axes[0, 0].scatter(targets[:, 10], predictions[:, 10], alpha=0.5, s=1)
-    axes[0, 0].plot([0, 1], [0, 1], 'r--', alpha=0.8)
-    axes[0, 0].set_xlabel('True P(rating=5)')
-    axes[0, 0].set_ylabel('Predicted P(rating=5)')
-    axes[0, 0].set_title(f'Epoch {epoch}: Prediction vs Target')
+    # Plot 1: Class distribution comparison
+    class_names = [str(i-5) for i in range(11)]  # -5 to +5
+    
+    x = np.arange(len(class_names))
+    width = 0.35
+    
+    axes[0, 0].bar(x - width/2, pred_mean, width, label='Predictions', alpha=0.7)
+    axes[0, 0].bar(x + width/2, target_mean, width, label='Targets', alpha=0.7)
+    axes[0, 0].set_xlabel('Likert Scale Rating')
+    axes[0, 0].set_ylabel('Mean Probability')
+    axes[0, 0].set_title(f'Epoch {epoch}: Class Distribution Comparison')
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(class_names)
+    axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # Plot 2: Prediction distribution
-    axes[0, 1].hist(predictions[:, 10], bins=50, alpha=0.7, label='Predictions')
-    axes[0, 1].hist(targets[:, 10], bins=50, alpha=0.7, label='Targets')
-    axes[0, 1].set_xlabel('P(rating=5)')
-    axes[0, 1].set_ylabel('Count')
-    axes[0, 1].set_title(f'Epoch {epoch}: Distribution Comparison')
-    axes[0, 1].legend()
+    # Plot 2: Prediction vs Target scatter for most frequent class
+    most_frequent_class = np.argmax(target_mean)
+    axes[0, 1].scatter(targets[:, most_frequent_class], predictions[:, most_frequent_class], alpha=0.5, s=1)
+    axes[0, 1].plot([0, 1], [0, 1], 'r--', alpha=0.8)
+    axes[0, 1].set_xlabel(f'True P(rating={most_frequent_class-5})')
+    axes[0, 1].set_ylabel(f'Predicted P(rating={most_frequent_class-5})')
+    axes[0, 1].set_title(f'Epoch {epoch}: Most Frequent Class Prediction vs Target')
     axes[0, 1].grid(True, alpha=0.3)
     
     # Plot 3: Error distribution
-    errors = predictions[:, 10] - targets[:, 10]
-    axes[1, 0].hist(errors, bins=50, alpha=0.7)
+    errors = predictions - targets
+    mean_abs_error = np.mean(np.abs(errors))
+    axes[1, 0].hist(errors.flatten(), bins=50, alpha=0.7)
     axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.8)
     axes[1, 0].set_xlabel('Prediction Error')
     axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (bias={pred_bias:.3f})')
+    axes[1, 0].set_title(f'Epoch {epoch}: Error Distribution (MAE={mean_abs_error:.3f})')
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Plot 4: Error vs Target
-    axes[1, 1].scatter(targets[:, 10], errors, alpha=0.5, s=1)
-    axes[1, 1].axhline(0, color='red', linestyle='--', alpha=0.8)
-    axes[1, 1].set_xlabel('True P(rating=5)')
-    axes[1, 1].set_ylabel('Prediction Error')
-    axes[1, 1].set_title(f'Epoch {epoch}: Error vs Target')
+    # Plot 4: Predicted vs actual rating distribution (argmax)
+    pred_labels = np.argmax(predictions, axis=1) - 5  # Convert back to -5:5 scale
+    true_labels = np.argmax(targets, axis=1) - 5
+    
+    rating_range = range(-5, 6)
+    pred_counts = [np.sum(pred_labels == r) for r in rating_range]
+    true_counts = [np.sum(true_labels == r) for r in rating_range]
+    
+    x = np.arange(len(rating_range))
+    axes[1, 1].bar(x - width/2, pred_counts, width, label='Predicted', alpha=0.7)
+    axes[1, 1].bar(x + width/2, true_counts, width, label='True', alpha=0.7)
+    axes[1, 1].set_xlabel('Rating (Likert Scale)')
+    axes[1, 1].set_ylabel('Count')
+    axes[1, 1].set_title(f'Epoch {epoch}: Predicted vs True Rating Counts')
+    axes[1, 1].set_xticks(x)
+    axes[1, 1].set_xticklabels([str(r) for r in rating_range])
+    axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'epoch_{epoch}_analysis.png'), dpi=150, bbox_inches='tight')
     plt.close()
     
+    # Calculate accuracy (exact match)
+    accuracy = np.mean(pred_labels == true_labels)
+    
     return {
-        'pred_bias': pred_bias,
-        'pred_std': pred_std,
-        'target_std': target_std,
-        'mean_error': np.mean(np.abs(errors))
+        'overall_bias': float(overall_bias),
+        'pred_mean': pred_mean.tolist(),
+        'target_mean': target_mean.tolist(),
+        'pred_std': pred_std.tolist(),
+        'target_std': target_std.tolist(),
+        'mean_abs_error': float(mean_abs_error),
+        'accuracy': float(accuracy)
     }
 
 
-def save_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
-    """Save training metrics to JSON file."""
-    os.makedirs(output_dir, exist_ok=True)
-    
+def plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, output_dir):
+    """Plot and save training metrics and curves."""
+    epochs_range = list(range(1, len(train_loss_history) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Training loss vs validation distance
+    ax_comb = axes[0, 0]
+    ax_comb.plot(epochs_range, train_loss_history, marker='o', color='blue', label='Train Loss')
+    if val_dist_history:
+        ax_comb_twin = ax_comb.twinx()
+        ax_comb_twin.plot(epochs_range, val_dist_history, marker='s', color='orange', label='Val L1 Dist')
+        ax_comb_twin.set_ylabel('Validation Distance', color='orange')
+        ax_comb_twin.tick_params(axis='y', labelcolor='orange')
+    ax_comb.set_title('Training Loss vs Validation Distance')
+    ax_comb.set_xlabel('Epoch')
+    ax_comb.set_ylabel('Training Loss', color='blue')
+    ax_comb.tick_params(axis='y', labelcolor='blue')
+    ax_comb.grid(True, alpha=0.3)
+
+    # Validation distance with best epoch marker
+    if val_dist_history:
+        axes[0, 1].plot(epochs_range, val_dist_history, marker='o', color='orange')
+        axes[0, 1].set_title('Validation Manhattan Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].scatter([best_epoch], [val_dist_history[best_epoch - 1]], color='red', s=100, zorder=5)
+        axes[0, 1].text(best_epoch, val_dist_history[best_epoch - 1], f'  best={val_dist_history[best_epoch - 1]:.3f}', fontsize=10)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs_range, lr_history, marker='o', color='green')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Analysis metrics
+    if analysis_history:
+        accuracies = [a['accuracy'] for a in analysis_history]
+        biases = [a['overall_bias'] for a in analysis_history]
+        axes[1, 1].plot(epochs_range, accuracies, marker='o', label='Accuracy', color='purple')
+        ax_twin = axes[1, 1].twinx()
+        ax_twin.plot(epochs_range, biases, marker='s', label='Overall Bias', color='brown')
+        axes[1, 1].set_title('Accuracy and Bias')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy', color='purple')
+        ax_twin.set_ylabel('Overall Bias', color='brown')
+        axes[1, 1].tick_params(axis='y', labelcolor='purple')
+        ax_twin.tick_params(axis='y', labelcolor='brown')
+        axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
     # Save metrics to JSON
     metrics = {
         'train_loss': [float(x) for x in train_loss_history],
         'val_distance': [float(x) for x in val_dist_history] if val_dist_history else [],
         'learning_rates': [float(x) for x in lr_history],
-        'analysis': [
-            {
-                'pred_bias': float(a['pred_bias']),
-                'pred_std': float(a['pred_std']),
-                'target_std': float(a['target_std']),
-                'mean_error': float(a['mean_error'])
-            } for a in analysis_history
-        ],
+        'analysis': analysis_history,
         'best_epoch': int(best_epoch) if val_dist_history else None,
         'best_metric': float(best_metric) if val_dist_history else None
     }
     
     with open(os.path.join(output_dir, 'training_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
+
+
+def visualize_demog_embeddings(model, dataset, output_dir: str):
+    """Enhanced PCA visualization of demographic embeddings with better error handling and features."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import seaborn as sns
+    try:
+        from sklearn.decomposition import PCA
+        use_sklearn = True
+    except ImportError:
+        use_sklearn = False
+        print("Warning: sklearn not available, using manual PCA")
     
-    print(f"Saved training metrics → {os.path.join(output_dir, 'training_metrics.json')}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Set style for better plots
+    plt.style.use('default')
+    if 'seaborn' in sys.modules:
+        sns.set_palette("husl")
+
+    # Get field names and their display names
+    field_display_names = {
+        "age": "Age",
+        "gender": "Gender", 
+        "nationality": "Nationality",
+        "education": "Education",
+        "ethnicity": "Ethnicity",
+        "country_birth": "Country of Birth",
+        "country_residence": "Country of Residence",
+        "student": "Student Status",
+        "employment": "Employment Status"
+    }
+
+    print("Creating PCA visualizations for demographic embeddings...")
+    
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            print(f"Skipping {field_name} - not found in dataset vocabulary")
+            continue
+            
+        display_name = field_display_names.get(field_name, field_name.replace("_", " ").title())
+        
+        # Get embeddings and labels
+        emb = emb_layer.weight.detach().cpu().numpy()
+        all_labels = list(dataset.vocab[field_name].keys())
+        
+        if emb.shape[0] <= 2:
+            print(f"Skipping {display_name} - insufficient embeddings (only {emb.shape[0]})")
+            continue
+            
+        # Skip PAD and UNK tokens
+        emb_clean = emb[2:]  # Remove PAD (index 0) and UNK (index 1)
+        labels_clean = all_labels[2:]  # Remove PAD and UNK labels
+        
+        if len(labels_clean) != emb_clean.shape[0]:
+            print(f"Skipping {display_name} - label/embedding mismatch")
+            continue
+        
+        if emb_clean.shape[0] < 2:
+            print(f"Skipping {display_name} - need at least 2 categories for visualization")
+            continue
+        
+        # Center the embeddings
+        emb_centered = emb_clean - emb_clean.mean(axis=0)
+        
+        # Use sklearn PCA if available, otherwise manual PCA
+        try:
+            # Determine number of components
+            n_samples, n_features = emb_centered.shape
+            n_components = min(2, n_features, n_samples)
+            
+            if n_components < 1:
+                print(f"Skipping {display_name} - insufficient dimensions")
+                continue
+            
+            if use_sklearn:
+                pca = PCA(n_components=n_components)
+                coords = pca.fit_transform(emb_centered)
+                explained_var = pca.explained_variance_ratio_
+            else:
+                # Manual PCA using SVD
+                U, S, Vt = np.linalg.svd(emb_centered, full_matrices=False)
+                n_components = min(n_components, Vt.shape[0])
+                coords = emb_centered.dot(Vt.T[:, :n_components])
+                # Calculate explained variance manually
+                total_var = np.sum(S**2)
+                explained_var = (S[:n_components]**2) / total_var
+            
+            # Create figure
+            fig, axes = plt.subplots(1, 2 if n_components == 2 else 1, 
+                                   figsize=(16, 6) if n_components == 2 else (10, 6))
+            if n_components == 1:
+                axes = [axes]  # Make it iterable
+            
+            # Main PCA plot
+            ax_main = axes[0]
+            
+            if n_components == 2:
+                # 2D scatter plot
+                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
+                scatter = ax_main.scatter(coords[:, 0], coords[:, 1], 
+                                        c=colors, alpha=0.8, s=100, edgecolors='black', linewidth=0.5)
+                
+                # Add labels with smart positioning to avoid overlap
+                for i, label in enumerate(labels_clean):
+                    # Only show label if it's not too crowded
+                    if i % max(1, len(labels_clean) // 15) == 0 or len(labels_clean) <= 10:
+                        ax_main.annotate(label, (coords[i, 0], coords[i, 1]), 
+                                       xytext=(5, 5), textcoords='offset points',
+                                       fontsize=9, alpha=0.8, 
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+                
+                ax_main.set_xlabel(f"PC1 ({explained_var[0]:.1%} variance)")
+                ax_main.set_ylabel(f"PC2 ({explained_var[1]:.1%} variance)")
+                ax_main.set_title(f"{display_name} Embeddings (PCA 2D)")
+                
+                # Variance explained plot
+                if len(axes) > 1:
+                    ax_var = axes[1]
+                    ax_var.bar(['PC1', 'PC2'], explained_var, color=['skyblue', 'lightcoral'])
+                    ax_var.set_ylabel('Explained Variance Ratio')
+                    ax_var.set_title('Variance Explained by Components')
+                    ax_var.set_ylim(0, 1)
+                    for i, v in enumerate(explained_var):
+                        ax_var.text(i, v + 0.02, f'{v:.1%}', ha='center', va='bottom')
+                        
+            else:
+                # 1D plot
+                x_pos = np.arange(len(coords))
+                colors = plt.cm.Set3(np.linspace(0, 1, len(labels_clean)))
+                ax_main.scatter(x_pos, coords[:, 0], c=colors, alpha=0.8, s=100, 
+                              edgecolors='black', linewidth=0.5)
+                
+                # Add labels
+                for i, label in enumerate(labels_clean):
+                    if i % max(1, len(labels_clean) // 10) == 0:  # Show more labels in 1D
+                        ax_main.annotate(label, (x_pos[i], coords[i, 0]), 
+                                       xytext=(0, 10), textcoords='offset points',
+                                       fontsize=9, alpha=0.8, rotation=45,
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+                
+                ax_main.set_xlabel("Category Index")
+                ax_main.set_ylabel(f"PC1 ({explained_var[0]:.1%} variance)")
+                ax_main.set_title(f"{display_name} Embeddings (PCA 1D)")
+                ax_main.set_xticks(x_pos[::max(1, len(x_pos)//10)])
+            
+            # Add grid and improve aesthetics
+            for ax in axes:
+                ax.grid(True, alpha=0.3)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+            
+            plt.tight_layout()
+            
+            # Save plot
+            fname = os.path.join(output_dir, f"{field_name}_embeddings_pca.png")
+            plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
+            
+            print(f"✓ Saved {display_name} PCA visualization → {fname}")
+            print(f"  - {len(labels_clean)} categories, {n_components}D projection")
+            if n_components == 2:
+                print(f"  - Explained variance: PC1={explained_var[0]:.1%}, PC2={explained_var[1]:.1%}")
+            else:
+                print(f"  - Explained variance: PC1={explained_var[0]:.1%}")
+                
+        except Exception as e:
+            print(f"Error creating PCA plot for {display_name}: {e}")
+            continue
+    
+    print("PCA visualization complete!")
+
+
+def create_embedding_summary_plot(model, dataset, output_dir: str):
+    """Create a summary plot showing embedding space dimensions and distributions."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    
+    # Collect information about all embeddings
+    embedding_info = {}
+    
+    for field_name, emb_layer in model.demographic_embeddings.items():
+        if field_name not in dataset.vocab:
+            continue
+            
+        emb = emb_layer.weight.detach().cpu().numpy()
+        vocab_size = len(dataset.vocab[field_name])
+        
+        # Calculate embedding statistics
+        emb_clean = emb[2:]  # Skip PAD and UNK
+        if emb_clean.shape[0] > 0:
+            embedding_info[field_name] = {
+                'vocab_size': vocab_size - 2,  # Exclude PAD and UNK
+                'embedding_dim': emb.shape[1],
+                'mean_norm': np.mean(np.linalg.norm(emb_clean, axis=1)),
+                'std_norm': np.std(np.linalg.norm(emb_clean, axis=1)),
+                'mean_cosine_sim': np.mean([
+                    np.dot(emb_clean[i], emb_clean[j]) / 
+                    (np.linalg.norm(emb_clean[i]) * np.linalg.norm(emb_clean[j]))
+                    for i in range(len(emb_clean)) for j in range(i+1, len(emb_clean))
+                ]) if len(emb_clean) > 1 else 0
+            }
+    
+    if not embedding_info:
+        return
+    
+    # Create summary plot
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    fields = list(embedding_info.keys())
+    field_display_names = {
+        "age": "Age", "gender": "Gender", "nationality": "Nationality",
+        "education": "Education", "ethnicity": "Ethnicity"
+    }
+    display_fields = [field_display_names.get(f, f.replace("_", " ").title()) for f in fields]
+    
+    # Plot 1: Vocabulary sizes
+    vocab_sizes = [embedding_info[f]['vocab_size'] for f in fields]
+    axes[0, 0].bar(display_fields, vocab_sizes, color='skyblue', alpha=0.7)
+    axes[0, 0].set_title('Vocabulary Sizes')
+    axes[0, 0].set_ylabel('Number of Categories')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    # Plot 2: Embedding norms
+    mean_norms = [embedding_info[f]['mean_norm'] for f in fields]
+    std_norms = [embedding_info[f]['std_norm'] for f in fields]
+    axes[0, 1].bar(display_fields, mean_norms, yerr=std_norms, 
+                   color='lightcoral', alpha=0.7, capsize=5)
+    axes[0, 1].set_title('Embedding Norms (Mean ± Std)')
+    axes[0, 1].set_ylabel('L2 Norm')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    
+    # Plot 3: Cosine similarities
+    cosine_sims = [embedding_info[f]['mean_cosine_sim'] for f in fields]
+    axes[1, 0].bar(display_fields, cosine_sims, color='lightgreen', alpha=0.7)
+    axes[1, 0].set_title('Mean Pairwise Cosine Similarity')
+    axes[1, 0].set_ylabel('Cosine Similarity')
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    axes[1, 0].set_ylim(-1, 1)
+    
+    # Plot 4: Embedding dimensions
+    emb_dims = [embedding_info[f]['embedding_dim'] for f in fields]
+    axes[1, 1].bar(display_fields, emb_dims, color='gold', alpha=0.7)
+    axes[1, 1].set_title('Embedding Dimensions')
+    axes[1, 1].set_ylabel('Dimension')
+    axes[1, 1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    summary_path = os.path.join(output_dir, 'demographic_embeddings_summary.png')
+    plt.savefig(summary_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"✓ Saved embedding summary plot → {summary_path}")
 
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Initialize tokenizer
-    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    
-    train_ds = ParDataset(args.train_file, tokenizer, args.max_length)
-    val_ds = ParDataset(args.val_file, tokenizer, args.max_length) if args.val_file else None
+    train_ds = ParDataset(args.train_file, tokenizer, args.annot_meta, args.max_length)
+    val_ds = ParDataset(args.val_file, tokenizer, args.annot_meta, args.max_length) if args.val_file else None
 
     print(f"Training samples: {len(train_ds)}")
     if val_ds:
         print(f"Validation samples: {len(val_ds)}")
-    print("Using NO demographic embeddings - RoBERTa-Large + SBERT only")
+    print(f"Using reduced demographic fields: {list(train_ds.active_field_keys.keys())}")
+    print(f"Demographic vocabulary sizes: {train_ds.vocab_sizes}")
 
     sampler = build_sampler(train_ds.labels) if args.balance else None
     train_loader = DataLoader(
@@ -448,13 +795,23 @@ def train(args):
         DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_ds else None
     )
 
-    model = ParModel(
+    model = ParDemogModel(
         base_name=args.model_name,
+        vocab_sizes=train_ds.vocab_sizes,
+        dem_dim=args.dem_dim,
         sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
-        num_classes=args.num_classes,
     )
     model.to(device)
+
+    frozen_layers = []
+    if getattr(args, "freeze_layers", 0) > 0:
+        for layer in model.text_model.encoder.layer[: args.freeze_layers]:
+            for p in layer.parameters():
+                p.requires_grad = False
+        frozen_layers = list(range(args.freeze_layers))
+        if frozen_layers:
+            print(f"Frozen transformer layers: {frozen_layers} for first {args.freeze_epochs} epoch(s)")
 
     no_decay = ["bias", "LayerNorm.weight"]
     grouped_params = [
@@ -483,11 +840,16 @@ def train(args):
     analysis_history = []
 
     print(f"Total training steps: {total_steps}")
-    print(f"Warmup steps: {warmup_steps}")
     print(f"Initial learning rate: {args.lr}")
-    print(f"Early stopping patience: {args.patience} epochs")
 
     for epoch in range(1, args.epochs + 1):
+        if frozen_layers and epoch > args.freeze_epochs:
+            for layer_idx in frozen_layers:
+                for p in model.text_model.encoder.layer[layer_idx].parameters():
+                    p.requires_grad = True
+            print(f"Unfroze layers {frozen_layers} at start of epoch {epoch}")
+            frozen_layers = []
+
         model.train()
         epoch_loss = 0.0
         step_count = 0
@@ -495,17 +857,24 @@ def train(args):
         for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"), 1):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
+            # Prepare demographic inputs dynamically (exclude input_ids, attention_mask, texts)
+            demographic_inputs = {k: v for k, v in batch.items() 
+                                if k.endswith("_ids") and k not in ["input_ids"]}
+            
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"]
+                texts=batch["texts"],
+                **demographic_inputs
             )
 
-            # Use cross-entropy loss with hard labels
-            loss = F.cross_entropy(logits, batch["labels"])
+            p_hat = torch.softmax(logits, dim=-1)
+            # Soft cross-entropy: -sum(target_dist * log(predicted_dist))
+            cross_entropy_loss = -torch.sum(batch["dist"] * torch.log(p_hat + 1e-12), dim=-1).mean()
+            loss = cross_entropy_loss
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimiser.step()
             scheduler.step()
             optimiser.zero_grad()
@@ -513,29 +882,22 @@ def train(args):
             epoch_loss += loss.item()
             step_count += 1
             
-            if step % 50 == 0:
+            if step % 100 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 avg_loss = epoch_loss / step_count
-                tqdm.write(f"Epoch {epoch} step {step}: loss={avg_loss:.4f}, lr={current_lr:.2e}")
+                tqdm.write(f"Epoch {epoch} step {step}: cross_entropy_loss={avg_loss:.4f}, lr={current_lr:.2e}")
 
         if val_loader:
-            val_dist, predictions, targets, embeddings, labels = evaluate(model, val_loader, device)
+            val_dist, predictions, targets = evaluate(model, val_loader, device)
             print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
-            
-            # Generate PCA plot for this epoch
-            generate_pca_plot(
-                embeddings, labels, args.output_dir, 
-                model_name="paraphrase_no_demog", epoch=epoch
-            )
             
             analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
             analysis_history.append(analysis)
             
             print(f"Epoch {epoch} Analysis:")
-            print(f"  Prediction bias: {analysis['pred_bias']:.4f}")
-            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
-            print(f"  Prediction std: {analysis['pred_std']:.4f}")
-            print(f"  Target std: {analysis['target_std']:.4f}")
+            print(f"  Accuracy: {analysis['accuracy']:.4f}")
+            print(f"  Mean absolute error: {analysis['mean_abs_error']:.4f}")
+            print(f"  Overall bias: {analysis['overall_bias']:.4f}")
             
             if val_dist < best_metric:
                 best_metric = val_dist
@@ -544,86 +906,39 @@ def train(args):
                 save_path = os.path.join(args.output_dir, "best_model")
                 os.makedirs(save_path, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
-                
-                # Generate PCA plot for best model
-                generate_pca_plot(
-                    embeddings, labels, save_path, 
-                    model_name="best_paraphrase_no_demog"
-                )
-                
-                # Save training metadata
-                metadata = {
-                    "best_epoch": best_epoch,
-                    "best_metric": best_metric,
-                    "training_config": {
-                        "lr": args.lr,
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "model_name": args.model_name,
-                        "patience": args.patience,
-                        "sbert_dim": args.sbert_dim,
-                        "dropout_rate": args.dropout_rate,
-                        "num_classes": args.num_classes,
-                        "demographics_enabled": False
-                    },
-                    "model_type": "no_demographics"
-                }
-                
-                with open(os.path.join(save_path, "training_metadata.json"), 'w') as f:
-                    json.dump(metadata, f, indent=2)
-                
-                print(f"Saved best model to {save_path}")
-                
+                tokenizer.save_pretrained(save_path)
+                print(f"New best model saved to {save_path}")
             else:
                 epochs_no_improve += 1
-                
-            val_dist_history.append(val_dist)
-            
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping after {epochs_no_improve} epochs without improvement")
-                break
-        
+
         train_loss_history.append(epoch_loss / step_count)
+        if val_loader:
+            val_dist_history.append(val_dist)
         lr_history.append(scheduler.get_last_lr()[0])
 
-    # Save training metrics
-    save_training_metrics(train_loss_history, val_dist_history, lr_history, 
-                         analysis_history, best_epoch, best_metric, args.output_dir)
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
 
-    # Save final model
-    final_path = os.path.join(args.output_dir, "final_model")
+    final_path = os.path.join(args.output_dir, "last_model")
     os.makedirs(final_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(final_path, "pytorch_model.bin"))
-    
-    # Generate final PCA plot
-    if val_loader:
-        _, _, _, embeddings, labels = evaluate(model, val_loader, device)
-        generate_pca_plot(
-            embeddings, labels, final_path, 
-            model_name="final_paraphrase_no_demog"
-        )
+    tokenizer.save_pretrained(final_path)
 
-    print(f"Training completed!")
-    print(f"Best validation distance: {best_metric:.4f} at epoch {best_epoch}")
-    
+    # Create visualizations
+    print("\nCreating demographic embedding visualizations...")
+    visualize_demog_embeddings(model, train_ds, args.output_dir)
+    create_embedding_summary_plot(model, train_ds, args.output_dir)
+    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+
+    print(f"\nTraining completed. Best validation distance: {best_metric:.4f}")
+    if val_dist_history:
+        print(f"Best epoch: {best_epoch}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT embeddings on Paraphrase detection (NO demographics) using cross-entropy loss.")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT and demographic embeddings on Paraphrase detection using cross-entropy loss with soft labels.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
-    parser.add_argument("--model_name", type=str, default="roberta-large", help="RoBERTa-Large model name (recommended)")
-    parser.add_argument("--output_dir", type=str, default="runs/outputs_par_no_demog")
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--balance", action="store_true", help="Use class-balanced sampler")
-    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
-    parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--warmup_ratio", type=float, default=0.15, help="Warmup ratio for learning rate scheduler")
-    parser.add_argument("--dropout_rate", type=float, default=0.3, help="Dropout rate for the model")
-    parser.add_argument("--num_classes", type=int, default=11, help="Number of classes (Likert scale -5 to 5)")
-
-    args = parser.parse_args()
-    train(args)
+    parser.add_argument("--model_name", type=str, default="roberta-large", help="HF model name")
+    parser
