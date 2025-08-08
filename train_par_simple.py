@@ -428,15 +428,6 @@ def train(args):
             val_dist, predictions, targets = evaluate(model, val_loader, device)
             print(f"Validation Manhattan distance after epoch {epoch}: {val_dist:.4f}")
             
-            analysis = analyze_predictions(predictions, targets, epoch, args.output_dir)
-            analysis_history.append(analysis)
-            
-            print(f"Epoch {epoch} Analysis:")
-            print(f"  Prediction bias: {analysis['pred_bias']:.4f}")
-            print(f"  Mean absolute error: {analysis['mean_error']:.4f}")
-            print(f"  Prediction std: {analysis['pred_std']:.4f}")
-            print(f"  Target std: {analysis['target_std']:.4f}")
-            
             if val_dist < best_metric:
                 best_metric = val_dist
                 best_epoch = epoch
@@ -492,7 +483,7 @@ def train(args):
         with open(os.path.join(best_model_path, "training_metadata.json"), 'w') as f:
             json.dump(metadata, f, indent=2)
 
-    plot_training_metrics(train_loss_history, val_dist_history, lr_history, analysis_history, best_epoch, best_metric, args.output_dir)
+    # Skip plotting for simple script
 
     print(f"Training completed!")
     print(f"Best validation distance: {best_metric:.4f} at epoch {best_epoch}")
