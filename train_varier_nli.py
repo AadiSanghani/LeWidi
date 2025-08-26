@@ -516,8 +516,6 @@ def plot_training_metrics(train_loss_history, val_dist_history, lr_history, anal
 
 def visualize_demog_embeddings(model, dataset: VariErrNLIDataset, output_dir: str):
     """Save 2-D PCA scatter plots of demographic embeddings."""
-    import matplotlib.pyplot as plt
-    import numpy as np
     os.makedirs(output_dir, exist_ok=True)
 
     # Get field names and their display names
