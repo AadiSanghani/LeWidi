@@ -16,12 +16,11 @@ import matplotlib.pyplot as plt
 
 
 class ParDemogModel(torch.nn.Module):
-    """RoBERTa-Large model with demographic embeddings and SBERT embeddings for annotator-aware paraphrase detection."""
+    """RoBERTa-Large model with demographic embeddings for annotator-aware paraphrase detection."""
     
-    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, sbert_dim: int = 384, dropout_rate: float = 0.3):
+    def __init__(self, base_name: str, vocab_sizes: dict, dem_dim: int = 8, dropout_rate: float = 0.3):
         super().__init__()
         from transformers import AutoModel
-        from sentence_transformers import SentenceTransformer
 
         # RoBERTa-Large as the main model (ensure we're using roberta-large)
         if "roberta-large" not in base_name.lower():
@@ -29,13 +28,6 @@ class ParDemogModel(torch.nn.Module):
             base_name = "roberta-large"
         
         self.text_model = AutoModel.from_pretrained(base_name)
-        
-        # SBERT model for additional embeddings (pretrained)
-        self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Freeze SBERT model parameters to use as a pretrained feature extractor
-        for param in self.sbert_model.parameters():
-            param.requires_grad = False
         
         # Create demographic embeddings dynamically based on vocab_sizes
         self.demographic_embeddings = torch.nn.ModuleDict()
@@ -45,27 +37,20 @@ class ParDemogModel(torch.nn.Module):
         # Get embedding dimension from RoBERTa-Large (should be 1024)
         hidden_size = self.text_model.config.hidden_size
         print(f"RoBERTa-Large hidden size: {hidden_size}")
-        print(f"SBERT embedding dimension: {sbert_dim}")
         
         num_demog_fields = len(vocab_sizes)
-        total_dim = hidden_size + sbert_dim + num_demog_fields * dem_dim
-        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {hidden_size} + SBERT: {sbert_dim} + Demographics: {num_demog_fields * dem_dim})")
+        total_dim = hidden_size + num_demog_fields * dem_dim
+        print(f"Total concatenated dimension: {total_dim} (RoBERTa: {hidden_size} + Demographics: {num_demog_fields * dem_dim})")
         
         # Layer normalization and dropout for regularization
         self.norm = torch.nn.LayerNorm(total_dim)
         self.dropout = torch.nn.Dropout(dropout_rate)
         self.classifier = torch.nn.Linear(total_dim, 11)  # Likert scale -5 to +5 (11 classes)
 
-    def forward(self, *, input_ids, attention_mask, texts, **demographic_inputs):
+    def forward(self, *, input_ids, attention_mask, **demographic_inputs):
         # Get RoBERTa embeddings from the main model
         outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0]  # [CLS] token
-        
-        # Get SBERT embeddings (frozen pretrained model)
-        with torch.no_grad():
-            sbert_embeddings = self.sbert_model.encode(texts, convert_to_tensor=True)
-            # Ensure SBERT embeddings are on the same device as RoBERTa embeddings
-            sbert_embeddings = sbert_embeddings.to(pooled.device)
         
         # Get demographic embeddings dynamically
         demographic_vectors = []
@@ -75,8 +60,8 @@ class ParDemogModel(torch.nn.Module):
                 demographic_vec = emb_layer(demographic_inputs[field_key])
                 demographic_vectors.append(demographic_vec)
 
-        # Concatenate all vectors: RoBERTa + SBERT + demographics
-        all_vectors = [pooled, sbert_embeddings] + demographic_vectors
+        # Concatenate all vectors: RoBERTa + demographics
+        all_vectors = [pooled] + demographic_vectors
         concat = torch.cat(all_vectors, dim=-1)
             
         # Apply layer normalization and dropout for regularization
@@ -267,7 +252,6 @@ class ParDataset(Dataset):
         result = {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
-            "texts": self.texts[idx],  # Keep original text for SBERT
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "dist": torch.tensor(self.dists[idx], dtype=torch.float),
         }
@@ -284,7 +268,6 @@ def collate_fn(batch):
 
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
-    texts = [b["texts"] for b in batch]
     labels = torch.stack([b["labels"] for b in batch])
     dists = torch.stack([b["dist"] for b in batch])
 
@@ -294,7 +277,6 @@ def collate_fn(batch):
     result = {
         "input_ids": input_ids,
         "attention_mask": attn,
-        "texts": texts,
         "labels": labels,
         "dist": dists,
     }
@@ -340,7 +322,6 @@ def evaluate(model, dataloader, device):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"],
                 **demographic_inputs
             )
             p_hat = torch.softmax(logits, dim=-1)
@@ -619,7 +600,6 @@ def train(args):
         base_name=args.model_name,
         vocab_sizes=train_ds.vocab_sizes,
         dem_dim=args.dem_dim,
-        sbert_dim=args.sbert_dim,
         dropout_rate=args.dropout_rate,
     )
     model.to(device)
@@ -684,7 +664,6 @@ def train(args):
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                texts=batch["texts"],
                 **demographic_inputs
             )
 
@@ -754,7 +733,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with SBERT and demographic embeddings on Paraphrase detection using cross-entropy loss with soft labels.")
+    parser = argparse.ArgumentParser(description="Fine-tune RoBERTa-Large with demographic embeddings on Paraphrase detection using cross-entropy loss with soft labels.")
     parser.add_argument("--train_file", type=str, default="dataset/Paraphrase/Paraphrase_train.json", help="Path to Paraphrase_train.json")
     parser.add_argument("--val_file", type=str, default="dataset/Paraphrase/Paraphrase_dev.json", help="Path to Paraphrase_dev.json")
     parser.add_argument("--model_name", type=str, default="roberta-large", help="HF model name")
@@ -767,7 +746,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--annot_meta", type=str, default="dataset/Paraphrase/Paraphrase_annotators_meta.json", help="Path to annotator metadata JSON")
     parser.add_argument("--dem_dim", type=int, default=8, help="Dimension of each demographic embedding")
-    parser.add_argument("--sbert_dim", type=int, default=384, help="Dimension of SBERT embeddings")
     parser.add_argument("--patience", type=int, default=5, help="Number of epochs without improvement for early stopping")
     parser.add_argument("--freeze_layers", type=int, default=0, help="Number of layers to freeze")
     parser.add_argument("--freeze_epochs", type=int, default=1, help="Number of epochs to freeze layers")
